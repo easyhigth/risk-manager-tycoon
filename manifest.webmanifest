@@ -1,0 +1,15 @@
+{
+  "name": "Risk Manager Tycoon — Prépa FRM",
+  "short_name": "Risk Tycoon",
+  "description": "Jeu de gestion des risques bancaires pour réviser le FRM, hors-ligne et bilingue FR/EN.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0e1217",
+  "theme_color": "#0e1217",
+  "lang": "fr",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
