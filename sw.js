@@ -1,5 +1,5 @@
 /* Risk Manager Tycoon — service worker (offline cache-first) */
-const CACHE = "rmt-v3-2";
+const CACHE = "rmt-v4";
 const ASSETS = [
   "./",
   "./index.html",

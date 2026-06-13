@@ -938,59 +938,159 @@ function answerQuiz(k){
   addXP(ok?12:4); save(); refresh();
 }
 
-/* ---- Examen blanc & révision (SM-2 + erreurs) ---- */
-let examState=null;
-function buildQuestionPool(ids){
-  return ids.map(id=>{const c=conceptById(id);const order=shuffle(c.quiz.opts.map((o,i)=>({o,i})));return {id,c,order};});
+/* ---- Examen blanc & révision (SM-2 + banque générée + session persistante) ---- */
+let examHolder={_open:false};
+const fEUR=v=>money(Math.round(v)), fPC=v=>(+v.toFixed(2))+" %", fX=v=>(+v.toFixed(2)).toString();
+function mkQ(qfr,qen,vals,fmt,expfr,expen,concept,calc){
+  // vals[0] = correct ; dédoublonne, mélange, renvoie une question sérialisable
+  const seen=new Set(), strs=[];
+  for(let v of vals){ let s=fmt(v),g=0; while(seen.has(s)&&g++<6){ v=v*1.13+ (v===0?1:0); s=fmt(v);} seen.add(s); strs.push(s); }
+  const order=shuffle(strs.map((o,i)=>({o,i})));
+  return {q:{fr:qfr,en:qen},opts:order.map(x=>({fr:x.o,en:x.o})),correct:order.findIndex(x=>x.i===0),exp:{fr:expfr,en:expen},concept,calc:!!calc};
+}
+function mkQT(qfr,qen,optPairs,correctIdx,expfr,expen,concept){ // options textuelles bilingues
+  const order=shuffle(optPairs.map((o,i)=>({o,i})));
+  return {q:{fr:qfr,en:qen},opts:order.map(x=>({fr:x.o[0],en:x.o[1]})),correct:order.findIndex(x=>x.i===correctIdx),exp:{fr:expfr,en:expen},concept};
+}
+const QGENS=[
+ {c:"var_param",calc:1,g:()=>{const P=ri(80,600)*1e6,s=rnd(0.8,3),z=pick([["99 %",2.33],["95 %",1.645]]);const v=P*s/100*z[1];
+   return mkQ(`Portefeuille de ${money(P)}, volatilité journalière ${s.toFixed(1)} %. VaR ${z[0]} (1 jour) ?`,`Portfolio of ${money(P)}, daily volatility ${s.toFixed(1)}%. 1-day ${z[0]} VaR?`,[v,P*s/100*(z[1]===2.33?1.645:2.33),P*s/100,v*Math.sqrt(10)],fEUR,`VaR = position × σ × z (z=${z[1]}). Les distracteurs utilisent le mauvais z, oublient z, ou scalent à 10 jours.`,`VaR = position × σ × z (z=${z[1]}). Distractors use the wrong z, omit z, or scale to 10 days.`,"var_param",1);}},
+ {c:"var_param",calc:1,g:()=>{const v1=ri(8,40)*1e6;const v10=v1*Math.sqrt(10);
+   return mkQ(`VaR 1 jour = ${money(v1)}. VaR 10 jours (i.i.d.) ?`,`1-day VaR = ${money(v1)}. 10-day VaR (i.i.d.)?`,[v10,v1*10,v1*Math.sqrt(252),v1],fEUR,"Règle de la racine du temps : VaR(10j) = VaR(1j) × √10 ≈ 3,16×.","Square-root-of-time rule: VaR(10d) = VaR(1d) × √10 ≈ 3.16×.","var_param",1);}},
+ {c:"var_hist",g:()=>{const N=pick([200,250,500]);const e=N*0.01;
+   return mkQ(`Backtesting d'une VaR 99 % sur ${N} jours : combien d'exceptions attendues ?`,`Backtesting a 99% VaR over ${N} days: expected number of exceptions?`,[e,N*0.05,N*0.001,e*10],fX,"Exceptions attendues = N × (1 − confiance) = N × 1 %.","Expected exceptions = N × (1 − confidence) = N × 1%.","var_hist");}},
+ {c:"es",calc:1,g:()=>{const v=ri(15,90)*1e6;return mkQ(`VaR 99 % = ${money(v)} (pertes normales). ES 99 % ≈ ?`,`99% VaR = ${money(v)} (normal losses). 99% ES ≈ ?`,[v*1.18,v*0.85,v,v*2.33],fEUR,"Sous normalité, ES99 ≈ 1,18 × VaR99 : l'ES moyenne la queue au-delà de la VaR, donc ES ≥ VaR.","Under normality, ES99 ≈ 1.18 × VaR99: ES averages the tail beyond VaR, so ES ≥ VaR.","es",1);}},
+ {c:"el",calc:1,g:()=>{const pd=rnd(1,6),lgd=ri(30,60),ead=ri(20,200)*1e6;const el=pd/100*lgd/100*ead;
+   return mkQ(`PD ${pd.toFixed(1)} %, LGD ${lgd} %, EAD ${money(ead)}. Perte attendue ?`,`PD ${pd.toFixed(1)}%, LGD ${lgd}%, EAD ${money(ead)}. Expected loss?`,[el,pd/100*ead,lgd/100*ead,el*10],fEUR,"EL = PD × LGD × EAD. Les distracteurs oublient LGD ou PD.","EL = PD × LGD × EAD. Distractors omit LGD or PD.","el",1);}},
+ {c:"pd",calc:1,g:()=>{const lgd=ri(35,60),ead=ri(40,150)*1e6,pd=rnd(1.5,5);const el=pd/100*lgd/100*ead;
+   return mkQ(`EL = ${money(el)}, LGD ${lgd} %, EAD ${money(ead)}. PD implicite ?`,`EL = ${money(el)}, LGD ${lgd}%, EAD ${money(ead)}. Implied PD?`,[pd,pd*lgd/100,pd*2,pd/2],fPC,"PD = EL / (LGD × EAD) — on inverse la formule de la perte attendue.","PD = EL / (LGD × EAD) — invert the expected-loss formula.","pd",1);}},
+ {c:"lgd",g:()=>{const r=ri(25,70);return mkQ(`Taux de recouvrement estimé à ${r} %. LGD ?`,`Estimated recovery rate ${r}%. LGD?`,[100-r,r,100,(100-r)/2],v=>Math.round(v)+" %","LGD = 1 − taux de recouvrement.","LGD = 1 − recovery rate.","lgd");}},
+ {c:"ead",calc:1,g:()=>{const tir=ri(20,80)*1e6,nd=ri(20,100)*1e6,ccf=pick([50,75]);const ead=tir+nd*ccf/100;
+   return mkQ(`Ligne tirée ${money(tir)}, non tirée ${money(nd)}, CCF ${ccf} %. EAD ?`,`Drawn ${money(tir)}, undrawn ${money(nd)}, CCF ${ccf}%. EAD?`,[ead,tir,tir+nd,nd*ccf/100],fEUR,"EAD = tiré + CCF × non tiré.","EAD = drawn + CCF × undrawn.","ead",1);}},
+ {c:"duration",calc:1,g:()=>{const D=rnd(3,9),dy=pick([50,100,150,200]),V=ri(50,300)*1e6;const dp=-D*dy/10000*V;
+   return mkQ(`Duration modifiée ${D.toFixed(1)}, taux +${dy} bp, valeur ${money(V)}. Δ prix ?`,`Modified duration ${D.toFixed(1)}, rates +${dy} bp, value ${money(V)}. Price change?`,[dp,-dp,dp/10,dp*10],fEUR,"ΔP ≈ −D × Δy × P : les prix baissent quand les taux montent.","ΔP ≈ −D × Δy × P: prices fall when rates rise.","duration",1);}},
+ {c:"convexity",g:()=>mkQT("Taux en forte hausse : par rapport à la prédiction « duration seule », le prix d'une obligation à convexité positive baisse…","Rates rise sharply: vs the duration-only prediction, a positively convex bond's price falls…",[["moins que prévu","less than predicted"],["plus que prévu","more than predicted"],["exactement comme prévu","exactly as predicted"],["de façon imprévisible","unpredictably"]],0,"La convexité (terme en Δy²) amortit la baisse et amplifie la hausse : elle joue toujours en faveur du détenteur.","Convexity (the Δy² term) cushions falls and boosts gains: it always favours the holder.","convexity")},
+ {c:"lcr",calc:1,g:()=>{const H=ri(15,40)/10,O=ri(12,35)/10;const l=H/O*100;
+   return mkQ(`HQLA ${H.toFixed(1)} Md€, sorties nettes 30 j ${O.toFixed(1)} Md€. LCR ?`,`HQLA €${H.toFixed(1)}bn, 30-day net outflows €${O.toFixed(1)}bn. LCR?`,[l,O/H*100,l/100,H*O],v=>Math.round(v)+" %","LCR = HQLA / sorties nettes 30 j ; minimum réglementaire 100 %.","LCR = HQLA / 30-day net outflows; regulatory minimum 100%.","lcr",1);}},
+ {c:"nsfr",calc:1,g:()=>{const A=ri(60,110)/10,R=ri(55,100)/10;const n=A/R*100;
+   return mkQ(`ASF ${A.toFixed(1)} Md€, RSF ${R.toFixed(1)} Md€. NSFR ?`,`ASF €${A.toFixed(1)}bn, RSF €${R.toFixed(1)}bn. NSFR?`,[n,R/A*100,n/10,A+R],v=>Math.round(v)+" %","NSFR = financement stable disponible / requis ; minimum 100 %.","NSFR = available / required stable funding; minimum 100%.","nsfr",1);}},
+ {c:"basel3",calc:1,g:()=>{const C=rnd(0.8,2.2),RWA=ri(8,20);const r=C/RWA*100;
+   return mkQ(`CET1 = ${C.toFixed(1)} Md€, RWA = ${RWA} Md€. Ratio CET1 ?`,`CET1 = €${C.toFixed(1)}bn, RWA = €${RWA}bn. CET1 ratio?`,[r,RWA/C,r/10,r*10],v=>v.toFixed(1)+" %","Ratio CET1 = fonds propres CET1 / actifs pondérés du risque (RWA).","CET1 ratio = CET1 capital / risk-weighted assets.","basel3",1);}},
+ {c:"leverage",g:()=>{const T=rnd(0.9,2),TA=ri(25,60);const r=T/TA*100;
+   return mkQ(`Tier 1 = ${T.toFixed(1)} Md€, exposition totale = ${TA} Md€. Ratio de levier ?`,`Tier 1 = €${T.toFixed(1)}bn, total exposure = €${TA}bn. Leverage ratio?`,[r,TA/T,r*10,r/10],v=>v.toFixed(1)+" %","Levier = Tier 1 / exposition totale NON pondérée (min. 3 %) — garde-fou du ratio pondéré.","Leverage = Tier 1 / total UNWEIGHTED exposure (min. 3%) — backstop to the risk-weighted ratio.","leverage");}},
+ {c:"capm",calc:1,g:()=>{const rf=rnd(1,3),b=rnd(0.6,1.8),rm=rnd(5,9);const e=rf+b*(rm-rf);
+   return mkQ(`Rf ${rf.toFixed(1)} %, β ${b.toFixed(1)}, E(Rm) ${rm.toFixed(1)} %. Rendement attendu (CAPM) ?`,`Rf ${rf.toFixed(1)}%, β ${b.toFixed(1)}, E(Rm) ${rm.toFixed(1)}%. Expected return (CAPM)?`,[e,b*rm,rf+rm,rm-rf],fPC,"E(R) = Rf + β(E(Rm) − Rf) : on rémunère le risque systématique seulement.","E(R) = Rf + β(E(Rm) − Rf): only systematic risk is rewarded.","capm",1);}},
+ {c:"raroc",calc:1,g:()=>{const rev=ri(8,30),el=ri(2,7),cap=ri(40,120);const r=(rev-el)/cap*100;
+   return mkQ(`Revenu ${rev} M€, EL ${el} M€, capital ${cap} M€. RAROC ?`,`Revenue €${rev}M, EL €${el}M, capital €${cap}M. RAROC?`,[r,rev/cap*100,(rev-el)/10,r*2],v=>v.toFixed(1)+" %","RAROC = (revenu − pertes attendues) / capital économique.","RAROC = (revenue − expected losses) / economic capital.","raroc",1);}},
+ {c:"delta",calc:1,g:()=>{const d=rnd(0.3,0.8),n=ri(500,4000);const h=d*n;
+   return mkQ(`${n} calls de delta ${d.toFixed(2)} (1 action chacun). Actions à vendre pour delta-neutraliser ?`,`${n} calls with delta ${d.toFixed(2)} (1 share each). Shares to sell to delta-hedge?`,[h,n,n/d,h/2],v=>Math.round(v)+"","Position delta = Δ × N → on vend Δ×N actions pour neutraliser.","Position delta = Δ × N → sell Δ×N shares to neutralise.","delta",1);}},
+ {c:"gamma",g:()=>mkQT("Un book delta-neutre à fort gamma négatif…","A delta-neutral book with large negative gamma…",[["perd quand le sous-jacent bouge fort, dans les deux sens","loses when the underlying moves sharply, either way"],["gagne sur tout grand mouvement","gains on any big move"],["est insensible au sous-jacent","is insensitive to the underlying"],["ne dépend que du temps","depends only on time"]],0,"Gamma négatif : le delta se dégrade contre toi quand le spot bouge — pertes sur les grands mouvements, gains de theta en compensation.","Negative gamma: delta moves against you as spot moves — losses on big moves, offset by theta income.","gamma")},
+ {c:"vega",g:()=>mkQT("Quelle grecque mesure la sensibilité du prix d'une option à la volatilité implicite ?","Which Greek measures an option's sensitivity to implied volatility?",[["Vega","Vega"],["Delta","Delta"],["Theta","Theta"],["Rho","Rho"]],0,"Vega = ∂V/∂σ. Acheter des options = être long vega.","Vega = ∂V/∂σ. Buying options = long vega.","vega")},
+ {c:"theta",g:()=>mkQT("Le détenteur d'une option vanille longue subit généralement…","A long vanilla option holder generally suffers…",[["une érosion de valeur avec le temps (theta négatif)","value decay over time (negative theta)"],["un gain de valeur avec le temps","value gain over time"],["aucun effet du temps","no time effect"],["un theta toujours nul à la monnaie","always zero theta at the money"]],0,"Le temps qui passe érode la valeur temps : theta est le prix de la convexité (gamma) détenue.","Passing time erodes time value: theta is the price of the gamma you hold.","theta")},
+ {c:"volatility",calc:1,g:()=>{const s=rnd(0.6,2.5);const a=s*Math.sqrt(252);
+   return mkQ(`Volatilité journalière ${s.toFixed(2)} %. Volatilité annualisée (252 j) ?`,`Daily volatility ${s.toFixed(2)}%. Annualised volatility (252 days)?`,[a,s*252,s*12,s*Math.sqrt(12)],v=>v.toFixed(1)+" %","σ_annuelle = σ_jour × √252 (≈ ×15,9).","σ_annual = σ_daily × √252 (≈ ×15.9).","volatility",1);}},
+ {c:"correlation_stat",calc:1,g:()=>{const rho=pick([[0,14.1],[0.5,17.3],[1,20],[-1,0]]);
+   return mkQ(`Deux actifs 50/50, σ = 20 % chacun, ρ = ${rho[0]}. Volatilité du portefeuille ?`,`Two assets 50/50, σ = 20% each, ρ = ${rho[0]}. Portfolio volatility?`,[rho[1],20,10,rho[0]===1?14.1:20*(1+rho[0])/2],v=>(+v.toFixed(1))+" %","σp = 20 % × √((1+ρ)/2) : la diversification disparaît quand ρ→1 et devient parfaite quand ρ=−1.","σp = 20% × √((1+ρ)/2): diversification vanishes as ρ→1 and is perfect at ρ=−1.","correlation_stat",1);}},
+ {c:"putcall",calc:1,g:()=>{const S0=ri(80,120),K=ri(80,120),P=rnd(2,9);const C=P+S0-K;
+   return mkQ(`Put ${P.toFixed(1)} €, spot ${S0} €, strike ${K} € (r≈0). Prix du call (parité) ?`,`Put €${P.toFixed(1)}, spot €${S0}, strike €${K} (r≈0). Call price (parity)?`,[C,P,S0-K,P-S0+K],v=>(+v.toFixed(1))+" €","Parité call-put : C − P = S − K·e^(−rT) ≈ S − K quand r≈0.","Put-call parity: C − P = S − K·e^(−rT) ≈ S − K when r≈0.","putcall",1);}},
+ {c:"forwardfut",calc:1,g:()=>{const r1=rnd(2,4),r2=r1+rnd(0.2,1.2);const f=2*r2-r1;
+   return mkQ(`Taux 1 an ${r1.toFixed(1)} %, taux 2 ans ${r2.toFixed(1)} %. Taux forward 1 an dans 1 an (approx.) ?`,`1-year rate ${r1.toFixed(1)}%, 2-year rate ${r2.toFixed(1)}%. 1y1y forward rate (approx.)?`,[f,(r1+r2)/2,r2-r1,r2],fPC,"Approximation : f ≈ 2·r2 − r1 (le forward « complète » le taux long).","Approximation: f ≈ 2·r2 − r1 (the forward 'completes' the long rate).","forwardfut",1);}},
+ {c:"netting",calc:1,g:()=>{const a=ri(30,120),b=ri(10,100);const net=Math.abs(a-b),gross=a+b;
+   return mkQ(`Avec une contrepartie : +${a} M€ et −${b} M€. Exposition nette avec netting ?`,`With one counterparty: +€${a}M and −€${b}M. Net exposure with netting?`,[net,gross,a,b],v=>Math.round(v)+" M€","Le netting compense les positions : exposition = |somme| au lieu de la somme des bruts.","Netting offsets positions: exposure = |sum| instead of the sum of gross amounts.","netting",1);}},
+ {c:"haircut",calc:1,g:()=>{const V=ri(40,200)*1e6,hc=pick([5,10,15,25]);const ret=V*(1-hc/100);
+   return mkQ(`Collatéral de ${money(V)}, haircut ${hc} %. Valeur retenue ?`,`Collateral of ${money(V)}, ${hc}% haircut. Recognised value?`,[ret,V,V*hc/100,V*(1+hc/100)],fEUR,"Valeur retenue = valeur de marché × (1 − haircut) : le haircut couvre le risque de liquidation.","Recognised value = market value × (1 − haircut): the haircut covers liquidation risk.","haircut",1);}},
+ {c:"cds",calc:1,g:()=>{const N=ri(20,150)*1e6,s=ri(80,400);const pr=N*s/10000;
+   return mkQ(`CDS de ${money(N)} au spread de ${s} bp. Prime annuelle ?`,`CDS of ${money(N)} at a ${s} bp spread. Annual premium?`,[pr,N*s/100,N*s/1e6,pr/4],fEUR,"Prime = notionnel × spread (1 bp = 0,01 %).","Premium = notional × spread (1 bp = 0.01%).","cds",1);}},
+ {c:"oprisk",calc:1,g:()=>{const f=rnd(1.5,8),sev=rnd(0.4,3);const e=f*sev;
+   return mkQ(`Fréquence ${f.toFixed(1)} incidents/an, sévérité moyenne ${sev.toFixed(1)} M€. Perte op attendue/an ?`,`Frequency ${f.toFixed(1)} incidents/yr, mean severity €${sev.toFixed(1)}M. Expected annual op loss?`,[e,f+sev,sev,e*12],v=>(+v.toFixed(1))+" M€","EL_op = fréquence × sévérité moyenne (approche fréquence-sévérité).","EL_op = frequency × mean severity (frequency-severity approach).","oprisk",1);}},
+ {c:"duration",calc:1,g:()=>{const A=ri(20,80)/10,Lb=ri(20,80)/10,dr=pick([50,100,200]);const d=(A-Lb)*dr/10000*1000;
+   return mkQ(`Actifs sensibles ${A.toFixed(1)} Md€, passifs sensibles ${Lb.toFixed(1)} Md€, taux ${dr>0?"+":""}${dr} bp. Δ marge d'intérêt ?`,`Rate-sensitive assets €${A.toFixed(1)}bn, liabilities €${Lb.toFixed(1)}bn, rates +${dr} bp. Δ net interest income?`,[d,-d,(A+Lb)*dr/10000*1000,d/10],v=>(+v.toFixed(0))+" M€","ΔNII = (actifs sensibles − passifs sensibles) × Δr : le signe dépend du gap.","ΔNII = (RSA − RSL) × Δr: the sign depends on the gap.","duration",1);}},
+ {c:"distributions",calc:1,g:()=>{const m=ri(2,8),s=rnd(0.5,2);const lo=m-1.96*s,hi=m+1.96*s;
+   const ivs=[`[${lo.toFixed(1)} ; ${hi.toFixed(1)}]`,`[${(m-s).toFixed(1)} ; ${(m+s).toFixed(1)}]`,`[${(m-3*s).toFixed(1)} ; ${(m+3*s).toFixed(1)}]`,`[0 ; ${(2*m).toFixed(1)}]`];
+   return mkQ(`X ~ N(${m} ; σ=${s.toFixed(1)}). Intervalle contenant ~95 % des observations ?`,`X ~ N(${m}; σ=${s.toFixed(1)}). Interval containing ~95% of observations?`,ivs,x=>x,"≈95 % de la masse d'une normale est dans μ ± 1,96σ (68 % dans ±1σ, 99,7 % dans ±3σ).","≈95% of a normal's mass lies within μ ± 1.96σ (68% within ±1σ, 99.7% within ±3σ).","distributions",1);}},
+ {c:"regression",calc:1,g:()=>{const cv=rnd(0.5,3),va=rnd(0.8,3);const b=cv/va;
+   return mkQ(`Cov(actif, marché) = ${cv.toFixed(1)}, Var(marché) = ${va.toFixed(1)}. Bêta ?`,`Cov(asset, market) = ${cv.toFixed(1)}, Var(market) = ${va.toFixed(1)}. Beta?`,[b,va/cv,cv*va,b*2],v=>(+v.toFixed(2)).toString(),"β = Cov(Ri,Rm) / Var(Rm) — la pente de la régression des rendements.","β = Cov(Ri,Rm) / Var(Rm) — the slope of the return regression.","regression",1);}},
+ {c:"hypothesis",g:()=>{const p=pick([["0,03",true],["0,12",false]]);
+   return mkQT(`Test au seuil de 5 % : p-value = ${p[0]}. Conclusion ?`,`Test at the 5% level: p-value = ${p[0].replace(",",".")}. Conclusion?`,[[p[1]?"On rejette H0":"On ne rejette pas H0",p[1]?"Reject H0":"Fail to reject H0"],[p[1]?"On ne rejette pas H0":"On rejette H0",p[1]?"Fail to reject H0":"Reject H0"],["On accepte H1 avec certitude","Accept H1 with certainty"],["Le test est invalide","The test is invalid"]],0,"On rejette H0 si p-value < α. Une p-value ne « prouve » jamais H1.","Reject H0 if p-value < α. A p-value never 'proves' H1.","hypothesis");}},
+ {c:"backtest",g:()=>{const z=[[3,"verte","green"],[7,"jaune","yellow"],[12,"rouge","red"]];const i=ri(0,2);const cur=z[i];const o=z.filter((_,k)=>k!==i);
+   return mkQT(`${cur[0]} exceptions de VaR 99 % sur 250 jours : zone Bâle ?`,`${cur[0]} exceptions of 99% VaR over 250 days: Basel zone?`,[["Zone "+cur[1],cur[2]+" zone"],["Zone "+o[0][1],o[0][2]+" zone"],["Zone "+o[1][1],o[1][2]+" zone"],["Hors barème","Off the scale"]],0,"Bâle : ≤4 exceptions = verte ; 5–9 = jaune (multiplicateur accru) ; ≥10 = rouge (modèle rejeté).","Basel: ≤4 exceptions = green; 5–9 = yellow (higher multiplier); ≥10 = red (model rejected).","backtest");}},
+ {c:"monte_carlo",g:()=>mkQT("Pour quadrupler la précision (diviser l'erreur par 2) d'une simulation Monte-Carlo, il faut…","To halve the error of a Monte-Carlo estimate, you must…",[["multiplier le nombre de tirages par 4","quadruple the number of draws"],["doubler le nombre de tirages","double the draws"],["changer de générateur aléatoire","change the random generator"],["réduire l'horizon","shorten the horizon"]],0,"L'erreur décroît en 1/√N : précision ×2 ⇒ tirages ×4.","Error shrinks as 1/√N: ×2 precision ⇒ ×4 draws.","monte_carlo")},
+ {c:"evt",g:()=>mkQT("La théorie des valeurs extrêmes (EVT) sert surtout à…","Extreme value theory (EVT) is mainly used to…",[["modéliser la queue de distribution au-delà d'un seuil","model the distribution tail beyond a threshold"],["estimer la moyenne des rendements","estimate mean returns"],["lisser la volatilité","smooth volatility"],["calculer le bêta","compute beta"]],0,"EVT (GPD au-delà d'un seuil) modélise les pertes rares et sévères mieux que la normale.","EVT (GPD beyond a threshold) models rare, severe losses better than the normal.","evt")},
+ {c:"funding_liq",calc:1,g:()=>{const out=ri(15,60)/10,inn=ri(5,40)/10;const gap=out-inn;
+   return mkQ(`Sorties 30 j : ${out.toFixed(1)} Md€, entrées : ${inn.toFixed(1)} Md€. Besoin net de liquidité ?`,`30-day outflows €${out.toFixed(1)}bn, inflows €${inn.toFixed(1)}bn. Net liquidity need?`,[gap,out+inn,inn-out,out],v=>(+v.toFixed(1))+" Md€","Besoin net = sorties − entrées : c'est ce que les HQLA doivent couvrir.","Net need = outflows − inflows: what HQLA must cover.","funding_liq",1);}},
+ {c:"cva",g:()=>mkQT("Le CVA d'un portefeuille de dérivés augmente quand…","A derivatives portfolio's CVA rises when…",[["le spread de crédit de la contrepartie s'écarte","the counterparty's credit spread widens"],["la contrepartie poste plus de collatéral","the counterparty posts more collateral"],["l'exposition attendue diminue","expected exposure falls"],["le netting est renforcé","netting is strengthened"]],0,"CVA ≈ EPE × probabilité de défaut × LGD : tout ce qui accroît le risque de la contrepartie l'augmente.","CVA ≈ EPE × default probability × LGD: anything raising counterparty risk increases it.","cva")},
+ {c:"merton",g:()=>mkQT("Dans le modèle de Merton, les capitaux propres d'une firme s'analysent comme…","In Merton's model, a firm's equity is viewed as…",[["un call sur la valeur des actifs, strike = dette","a call on asset value, strike = debt"],["un put sur la dette","a put on the debt"],["une obligation sans risque","a risk-free bond"],["un forward sur les actifs","a forward on assets"]],0,"Les actionnaires reçoivent max(V−D, 0) à l'échéance : un call sur V de strike D.","Shareholders receive max(V−D, 0) at maturity: a call on V struck at D.","merton")},
+];
+const GEN_BY_CONCEPT={}; QGENS.forEach(qg=>{ (GEN_BY_CONCEPT[qg.c]=GEN_BY_CONCEPT[qg.c]||[]).push(qg); });
+function genQuestion(conceptId){
+  const gs=conceptId?GEN_BY_CONCEPT[conceptId]:null;
+  const qg=gs&&gs.length?pick(gs):pick(QGENS);
+  return qg.g();
+}
+function staticQuestion(c){
+  const order=shuffle(c.quiz.opts.map((o,i)=>({o,i})));
+  return {q:c.quiz.q,opts:order.map(x=>x.o),correct:order.findIndex(x=>x.i===c.quiz.correct),exp:c.quiz.exp,concept:c.id};
+}
+function buildSessionQuestions(ids,nGen){
+  const qs=[];
+  ids.forEach(id=>{ const c=conceptById(id); if(!c)return;
+    if(GEN_BY_CONCEPT[id]&&Math.random()<0.7) qs.push(genQuestion(id)); else qs.push(staticQuestion(c)); });
+  for(let i=0;i<nGen;i++) qs.push(genQuestion(null));
+  return shuffle(qs).slice(0,12);
 }
 function startExam(){
   const pool = S.learned.length>=6 ? S.learned : CONCEPTS.map(c=>c.id);
-  const ids=shuffle(pool).slice(0,10);
-  examState={mode:"exam",list:buildQuestionPool(ids),idx:0,score:0,answered:false,wrong:[]};
-  renderExam();
+  S.examSession={mode:"exam",qs:buildSessionQuestions(shuffle(pool).slice(0,6),4),idx:0,score:0,answered:false,pick:-1,wrong:[]};
+  save(); renderExam();
 }
 function startReview(){
   const due=dueReviews().map(c=>c.id);
   const pool = due.length? due : (S.learned.length? S.learned : CONCEPTS.map(c=>c.id));
-  const ids=shuffle(pool).slice(0,Math.min(12,pool.length));
-  examState={mode:"review",list:buildQuestionPool(ids),idx:0,score:0,answered:false,wrong:[]};
-  renderExam();
+  S.examSession={mode:"review",qs:buildSessionQuestions(shuffle(pool).slice(0,8),4),idx:0,score:0,answered:false,pick:-1,wrong:[]};
+  save(); renderExam();
 }
+function startReviewOf(ids){ S.examSession={mode:"review",qs:buildSessionQuestions(ids,0),idx:0,score:0,answered:false,pick:-1,wrong:[]}; save(); renderExam(); }
+function resumeExam(){ if(!S.examSession)return; examHolder={_open:false}; renderExam(); }
 function renderExam(){
-  const st=examState, q=st.list[st.idx], c=q.c, n=st.list.length;
+  const st=S.examSession; if(!st)return;
+  const q=st.qs[st.idx], n=st.qs.length;
   const title = st.mode==="exam"?t("Examen blanc FRM","FRM mock exam"):t("Révision du jour","Daily review");
-  let h=`<button class="x" onclick="closeExam()">✕</button>`;
+  let h=`<button class="x" onclick="pauseExam()">✕</button>`;
   h+=`<div class="kicker">${esc(title)} · ${st.idx+1}/${n}</div>`;
   h+=`<div class="exam-prog"><div style="width:${(st.idx/n)*100}%"></div></div>`;
-  h+=`<div style="font-size:11px;color:var(--muted);margin-bottom:4px">${esc(modName(c.mod))} · ${partLabel(c.part)}</div>`;
-  h+=`<h3 style="font-size:17px">${esc(L(c.quiz.q))}</h3><div class="spacer"></div>`;
-  q.order.forEach((it,k)=>{ h+=`<button class="qopt" id="eo${k}" onclick="examAnswer(${k})"><span class="qk">${String.fromCharCode(65+k)}</span><span>${esc(L(it.o))}</span></button>`; });
-  h+=`<div id="efb"></div>`;
-  openSheet(h); st.answered=false;
+  const c=conceptById(q.concept);
+  if(c) h+=`<div style="font-size:11px;color:var(--muted);margin-bottom:4px">${esc(modName(c.mod))} · ${partLabel(c.part)}</div>`;
+  h+=`<h3 style="font-size:17px">${esc(L(q.q))}</h3>`;
+  if(q.calc) h+=`<div style="font-size:11.5px;color:var(--faint);margin:2px 0 4px">🧮 ${t("Question calculatoire — les outils ci-dessous restent ouverts par-dessus, ta question t'attend.","Calculation question — the tools below open on top, your question stays put.")}</div>`;
+  h+=`<div class="btnrow" style="margin:4px 0 8px"><button class="btn sec sm" onclick="openCalcVaR()">📉 VaR</button><button class="btn sec sm" onclick="openCalcEL()">💳 EL</button><button class="btn sec sm" onclick="openCalcDur()">📈 ${t("Duration","Duration")}</button></div>`;
+  q.opts.forEach((o,k)=>{ let cls=""; if(st.answered){ if(k===q.correct)cls="right"; else if(k===st.pick)cls="wrong"; } h+=`<button class="qopt ${cls}" onclick="examAnswer(${k})"><span class="qk">${String.fromCharCode(65+k)}</span><span>${esc(L(o))}</span></button>`; });
+  if(st.answered){
+    const ok=st.pick===q.correct, last=st.idx>=n-1;
+    h+=`<div class="qfb ${ok?'ok':'no'}">${ok?'✓':'✕'} ${esc(L(q.exp))}</div><button class="btn sm" onclick="examNext()">${last?t("Voir le résultat","See result"):t("Suivant","Next")}</button>`;
+  }
+  showHeld(h,examHolder);
 }
 function examAnswer(k){
-  const st=examState; if(st.answered)return; st.answered=true;
-  const q=st.list[st.idx], correct=q.c.quiz.correct, chosen=q.order[k].i, ok=chosen===correct;
-  q.order.forEach((it,idx)=>{const el=$("eo"+idx);if(!el)return; if(it.i===correct)el.classList.add("right"); else if(idx===k)el.classList.add("wrong");});
-  S.quiz.total++; if(ok){S.quiz.correct++; st.score++;} else st.wrong.push(q.id);
-  srsReview(q.id, ok?5:2); learnConcept(q.id);
-  const fb=$("efb"), last=st.idx>=st.list.length-1;
-  if(fb) fb.innerHTML=`<div class="qfb ${ok?'ok':'no'}">${ok?'✓':'✕'} ${esc(L(q.c.quiz.exp))}</div>
-    <button class="btn sm" onclick="examNext()">${last?t("Voir le résultat","See result"):t("Suivant","Next")}</button>`;
-  save();
+  const st=S.examSession; if(!st||st.answered)return;
+  st.answered=true; st.pick=k;
+  const q=st.qs[st.idx], ok=k===q.correct;
+  S.quiz.total++; if(ok){S.quiz.correct++; st.score++;} else if(q.concept) st.wrong.push(q.concept);
+  if(q.concept&&conceptById(q.concept)){ srsReview(q.concept, ok?5:2); learnConcept(q.concept); }
+  save(); renderExam();
 }
-function examNext(){ const st=examState; if(st.idx>=st.list.length-1){ examResults(); return; } st.idx++; renderExam(); }
+function examNext(){
+  const st=S.examSession; if(!st)return;
+  if(st.idx>=st.qs.length-1){ examResults(); return; }
+  st.idx++; st.answered=false; st.pick=-1; save(); renderExam();
+}
+function pauseExam(){
+  examHolder._open=false; closeSheet();
+  if(S.examSession) toast("⏸ "+t("Session en pause — reprends-la depuis l'écran Apprendre.","Session paused — resume it from the Learn screen."));
+  refresh();
+}
 function examResults(){
-  const st=examState, n=st.list.length, pct=Math.round(st.score/n*100);
-  if(st.mode==="promo"){
-    const passed=pct>=70;
-    let h=`<button class="x" onclick="closeExam()">✕</button><div class="kicker">${t("Examen de promotion","Promotion exam")}</div>`;
-    h+=`<h3>${pct}% — ${st.score}/${n}</h3>`;
-    if(passed){ doPromote(); h+=`<p style="color:var(--good)">✓ ${t("Réussi ! Tu accèdes au grade de","Passed! You are promoted to")} <b>${esc(L(rankOf(S.rankIdx)))}</b>. ${t("Ta banque grandit — nouveaux défis.","Your bank grows — new challenges.")}</p>`; }
-    else { h+=`<p style="color:var(--warn)">${t("Pas encore : il faut ≥ 70 %. Révise tes points faibles et retente.","Not yet: you need ≥ 70%. Review your weak spots and retry.")}</p>`; }
-    h+=`<div class="btnrow"><button class="btn" onclick="closeExam()">${t("Continuer","Continue")}</button></div>`;
-    openSheet(h); save(); refresh(); return;
-  }
+  const st=S.examSession, n=st.qs.length, pct=Math.round(st.score/n*100);
+  S.examSession=null; examHolder._open=false;
   if(st.mode==="exam" && pct>S.examBest){ S.examBest=pct; }
   if(S.today){ if(st.mode==="review")S.today.reviewed++; else S.today.examed++; }
   let xp=st.score*10 + (pct>=70?40:0); addXP(xp);
@@ -998,15 +1098,15 @@ function examResults(){
   let h=`<button class="x" onclick="closeExam()">✕</button><div class="kicker">${st.mode==="exam"?t("Résultat d'examen","Exam result"):t("Révision terminée","Review done")}</div>`;
   h+=`<h3>${pct}% — ${st.score}/${n}</h3><p style="color:var(--muted)">${esc(verdict)}</p>`;
   h+=`<div class="calc-out"><div class="co-v">${readiness()}%</div><div class="co-l">${t("Préparation FRM estimée","Estimated FRM readiness")}</div></div>`;
-  if(st.wrong.length){ h+=`<div class="rule"></div><div style="font-size:12px;color:var(--muted);margin-bottom:8px">${t("À revoir :","To review:")}</div>`;
-    st.wrong.forEach(id=>{const c=conceptById(id); h+=`<button class="concept-item" style="width:100%" onclick="openConcept('${id}')"><span style="font-size:18px">${modIc(c.mod)}</span><span class="ci-name">${esc(L(c.name))}<small>${esc(modName(c.mod))}</small></span><span class="arr mono">›</span></button>`;}); }
+  const wrongIds=[...new Set(st.wrong)];
+  if(wrongIds.length){ h+=`<div class="rule"></div><div style="font-size:12px;color:var(--muted);margin-bottom:8px">${t("À revoir :","To review:")}</div>`;
+    wrongIds.forEach(id=>{const c=conceptById(id); if(!c)return; h+=`<button class="concept-item" style="width:100%" onclick="openConcept('${id}')"><span style="font-size:18px">${modIc(c.mod)}</span><span class="ci-name">${esc(L(c.name))}<small>${esc(modName(c.mod))}</small></span><span class="arr mono">›</span></button>`;}); }
   h+=`<div class="btnrow"><button class="btn sec" onclick="closeExam()">${t("Fermer","Close")}</button>`;
-  if(st.wrong.length) h+=`<button class="btn" onclick="startReviewOf(${JSON.stringify(st.wrong).replace(/"/g,'&quot;')})">${t("Réviser ces fiches","Review these")}</button>`;
+  if(wrongIds.length) h+=`<button class="btn" onclick="startReviewOf(${JSON.stringify(wrongIds).replace(/"/g,'&quot;')})">${t("Réviser ces fiches","Review these")}</button>`;
   h+=`</div>`;
-  openSheet(h); save(); refresh();
+  closeSheet(); openSheet(h); save(); refresh();
 }
-function startReviewOf(ids){ examState={mode:"review",list:buildQuestionPool(ids),idx:0,score:0,answered:false,wrong:[]}; renderExam(); }
-function closeExam(){ examState=null; closeSheet(); refresh(); }
+function closeExam(){ S.examSession=null; examHolder._open=false; closeAllSheets(); save(); refresh(); }
 /* ===================================================================
    INFRA : sauvegarde, XP, toasts, sheets
    =================================================================== */
@@ -1235,12 +1335,17 @@ const PROFILE_TRUTHS={
   deceptiveRebound:["latent","acute","latent","building"],
   irregular:["calm","building","falseAlarm","acute","latent"]
 };
-function genSeed(mod){
+function genSeed(mod,force){
   const arr=DECISIONS[mod];
   if(!arr||!arr.length) return {id:"e"+Date.now()+Math.floor(Math.random()*99999),mod,generic:true};
   const di=ri(0,arr.length-1);
-  const profile=pick(SERIES_PROFILES);
-  const truth=pick(PROFILE_TRUTHS[profile]);
+  let profile=pick(SERIES_PROFILES);
+  let truth=pick(PROFILE_TRUTHS[profile]);
+  if(force&&force.realBias!=null){
+    const want=Math.random()<force.realBias;
+    for(let i=0;i<14;i++){ const pr=pick(SERIES_PROFILES), tr=pick(PROFILE_TRUTHS[pr]);
+      if((["building","acute","latent"].includes(tr))===want){ profile=pr; truth=tr; break; } }
+  }
   const series=genSeries(profile);
   const prev=series.map(v=>Math.max(1,Math.round(v*rnd(0.85,1.0)+noise(8)))); // semaine précédente (référence)
   const cur=series[series.length-1], mx=Math.max(...series);
@@ -1303,13 +1408,6 @@ function checkMissions(){
 /* ===================================================================
    CARRIÈRE : examen de promotion + montée en grade
    =================================================================== */
-function startPromotionExam(){
-  const wm=weakestModules(4);
-  const pool=CONCEPTS.filter(c=>wm.includes(c.mod) || S.learned.includes(c.id)).map(c=>c.id);
-  const ids=shuffle(pool.length>=8?pool:CONCEPTS.map(c=>c.id)).slice(0,10);
-  examState={mode:"promo",list:buildQuestionPool(ids),idx:0,score:0,answered:false,wrong:[]};
-  renderExam();
-}
 function doPromote(){
   if(S.rankIdx>=RANKS.length-1)return;
   S.rankIdx++; S.counters.promotions++; S.pendingExamPassed=false;
@@ -1365,6 +1463,7 @@ function eventModule(){ // 70% un module à décisions riches (biaisé vers les 
 function genDay(s){
   s=s||S;
   s.today={events:0,studied:0,reviewed:0,hedged:0,examed:0,studyByMod:{}};
+  s.modelRuns=2; s.toolChall=null;
   const n = clamp(Math.round(rnd(2,4)*(s.settings.difficulty==="expert"?1.3:1)),2,5);
   s.events=[]; for(let i=0;i<n;i++){ s.events.push(genSeed(eventModule())); }
   s.missions=genMissions();
@@ -1388,6 +1487,43 @@ function nextDay(){
     for(const pe of due){ applyEffect(S,pe.e); if(pe.e.note) toast("⏳ "+L(pe.e.note)); }
   }
   driftHedges(move);
+  recalc(S);
+  // relations : un desk hostile freine le rendement ; une conformité hostile abaisse le seuil d'inspection
+  S.rel=S.rel||{desk:60,comp:60};
+  S.rel.desk=clamp(S.rel.desk+(60-S.rel.desk)*0.02,0,100); S.rel.comp=clamp(S.rel.comp+(60-S.rel.comp)*0.02,0,100);
+  if(S.rel.desk<35) S.metrics.rendement-=0.03;
+  // dossier réglementaire : les dépassements s'accumulent → inspection
+  S.reg=S.reg||{breaches:0,fines:0,lastInsp:0};
+  if((S.metrics.compliance&&S.metrics.compliance.indexOf("NON")>=0)||S.metrics.lcr<1) S.reg.breaches++;
+  const inspTh=S.rel.comp<35?6:8;
+  if(S.reg.breaches>=inspTh && S.day-S.reg.lastInsp>20){
+    const fine=Math.round(totalAssets(S)*0.003);
+    S.bs.cash-=fine; S.reg.fines++; S.reg.lastInsp=S.day; S.reg.breaches=Math.floor(S.reg.breaches/2);
+    S.metrics.reputation=clamp(S.metrics.reputation-8,0,100); recalc(S);
+    S.journal=S.journal||[]; S.journal.push({d:S.day,mod:"op",title:B("Inspection du régulateur","Regulator inspection"),choice:B("Amende pour dépassements répétés : −"+money(fine),"Fine for repeated breaches: −"+money(fine)),verdict:{fr:"Sanction réglementaire",en:"Regulatory sanction"},stance:null,truth:null,rev:true});
+    toast("⚖️ "+t("Inspection : amende de "+money(fine)+" pour dépassements répétés","Inspection: "+money(fine)+" fine for repeated breaches"));
+  }
+  // journal : la vérité des dossiers se révèle après quelques jours
+  if(S.journal) S.journal.forEach(j=>{ if(!j.rev && j.d<=S.day-6) j.rev=true; });
+  // cascades : un dossier mal géré en déclenche un autre
+  if(S.chains && S.chains.length){
+    const due=S.chains.filter(c=>c.day<=S.day+1); S.chains=S.chains.filter(c=>c.day>S.day+1);
+    for(const c of due){ if(S.events.length<4){ S.events.push(genSeed(c.mod)); toast("📨 "+t("Retombée d'un dossier précédent : nouveau cas sur ton bureau","Fallout from an earlier file: new case on your desk")); } }
+  }
+  // semaine de stress scénarisée
+  if(S.stressW){
+    S.bs.deposits*=0.995;
+    if(S.events.length<4) S.events.push(genSeed(pick(["liquidity","market"]),{realBias:0.65}));
+    S.stressW.left--;
+    if(S.stressW.left<=0){ const delta=S.metrics.capital-S.stressW.startCap; const ok=delta>-S.stressW.startCap*0.15;
+      addXP(60); const sw=S.stressW; S.stressW=null; save();
+      setTimeout(()=>{ let h=`<button class="x" onclick="closeSheet();refresh()">✕</button><div class="kicker">⚡ ${t("Fin de la semaine de stress","Stress week over")}</div>`;
+        h+=`<h3 style="color:${ok?'var(--good)':'var(--warn)'}">${ok?t("Tenu.","Held."):t("Éprouvé.","Battered.")}</h3>`;
+        h+=`<div class="dl"><div class="r"><span class="k">${t("Capital : variation","Capital: change")}</span><span class="v" style="color:${delta>=0?'var(--good)':'var(--crit)'}">${delta>=0?"+":""}${money(delta)}</span></div></div>`;
+        h+=`<p style="font-size:13px;color:var(--muted)">${t("Les crises réelles (2008, 2023) durent des semaines : ce qui compte est d'arriver avec des coussins et de ne pas vendre au pire moment.","Real crises (2008, 2023) last weeks: what matters is arriving with buffers and not selling at the worst point.")}</p>`;
+        h+=`<button class="btn" onclick="closeSheet();refresh()">${t("Continuer","Continue")}</button>`; openSheet(h); },50);
+    }
+  }
   recalc(S);
   // historique
   S.history.push(snapshot(S)); if(S.history.length>60)S.history.shift();
@@ -1545,10 +1681,38 @@ function openModule(mod){
 }
 /* ---- événements ---- */
 let currentEvent=null;
+let LASTDECIDE=null, evHolder={_open:false};
+/* ---- pression hiérarchique : voix du desk vs conformité (indépendantes de la vérité) ---- */
+const PRESSURE={
+ desk:[B("Le desk : « Chaque jour de couverture nous coûte du P&L. Ne sur-réagis pas. »","The desk: 'Every hedged day costs us P&L. Don't overreact.'"),
+       B("Le front office : « Nos concurrents gardent la position. Si on coupe, on rate le rebond. »","Front office: 'Competitors are holding. If we cut, we miss the rebound.'"),
+       B("Le trader senior : « C'est du bruit de marché classique. On a un budget de rendement à tenir. »","Senior trader: 'Classic market noise. We have a return budget to hit.'")],
+ comp:[B("La conformité : « Notre appétit au risque est déjà tendu. La prudence se justifie au comité. »","Compliance: 'Risk appetite is already stretched. Caution is defensible at committee.'"),
+       B("Le contrôle interne : « Un dépassement de plus et le dossier remonte au régulateur. »","Internal control: 'One more breach and the file goes to the regulator.'"),
+       B("La 2e ligne : « Si ça tourne mal sans trace d'action, c'est toi qui signes. »","2nd line: 'If this goes wrong with no documented action, your name is on it.'")]
+};
+const MEMOS={
+ market:[B("Bâle (FRTB) impose l'ES 97,5 % avec horizons de liquidité par facteur : les chocs de marché se capitalisent sur la queue, pas la moyenne.","Basel (FRTB) mandates 97.5% ES with per-factor liquidity horizons: market shocks are capitalised on the tail, not the mean."),
+   B("Le backtesting Bâle compte les exceptions de VaR sur 250 jours : zone verte ≤4, jaune 5–9, rouge ≥10 (modèle rejeté).","Basel backtesting counts VaR exceptions over 250 days: green ≤4, yellow 5–9, red ≥10 (model rejected).")],
+ credit:[B("IFRS 9 provisionne en pertes attendues (ECL) dès l'origination — la dégradation du crédit se paie avant le défaut.","IFRS 9 provisions expected credit losses (ECL) from origination — credit deterioration is paid for before default."),
+   B("Sous Bâle, EL = PD×LGD×EAD passe en provisions ; le capital couvre la perte inattendue (UL).","Under Basel, EL = PD×LGD×EAD goes to provisions; capital covers unexpected loss (UL).")],
+ liquidity:[B("Le LCR (≥100 %) couvre 30 jours de stress de sorties ; le NSFR (≥100 %) impose un financement stable à 1 an.","The LCR (≥100%) covers 30 days of outflow stress; the NSFR (≥100%) requires stable 1-year funding."),
+   B("Leçon 2008/2023 : la liquidité disparaît plus vite que la solvabilité — les coussins HQLA existent pour être consommés en stress.","2008/2023 lesson: liquidity vanishes faster than solvency — HQLA buffers exist to be drawn in stress.")],
+ op:[B("Bâle III remplace l'AMA par l'approche standard (SMA) : la composante pertes historiques pénalise les incidents répétés.","Basel III replaces AMA with the standardised approach (SMA): the loss component penalises repeated incidents."),
+   B("Les KRI servent d'indicateurs avancés : leur dépassement doit déclencher escalade et plan d'action documenté.","KRIs are leading indicators: breaching them must trigger escalation and a documented action plan.")],
+ counterparty:[B("CVA = ajustement pour le défaut de la contrepartie ; Bâle exige un capital dédié contre sa volatilité.","CVA = adjustment for counterparty default; Basel requires dedicated capital against its volatility."),
+   B("Netting + appels de marge réduisent l'EAD ; les haircuts couvrent le risque de liquidation du collatéral.","Netting + margin calls reduce EAD; haircuts cover collateral liquidation risk.")],
+ deriv:[B("Les grecques pilotent le capital FRTB : delta, vega et curvature sont chacun choqués séparément.","Greeks drive FRTB capital: delta, vega and curvature are each shocked separately."),
+   B("Un book delta-neutre n'est pas sans risque : gamma et vega restent — leçon de toutes les crises d'options.","A delta-neutral book is not riskless: gamma and vega remain — the lesson of every options blow-up.")]
+};
+const TRUTH_LABELS={calm:{fr:"marché calme (rien à signaler)",en:"calm market (nothing there)",col:"var(--good)"},falseAlarm:{fr:"faux signal",en:"false alarm",col:"var(--good)"},building:{fr:"risque qui montait réellement",en:"genuinely building risk",col:"var(--warn)"},acute:{fr:"choc réel imminent",en:"real imminent shock",col:"var(--crit)"},latent:{fr:"risque latent réel",en:"real latent risk",col:"var(--warn)"}};
 function openEvent(id){
   const seed=S.events.find(e=>e.id===id); if(!seed)return;
   const ev=eventFromSeed(seed); currentEvent={id,ev};
-  let h=`<button class="x" onclick="closeSheet()">✕</button><div class="kicker">${esc(L(ev.tag))}</div>`;
+  evHolder={_open:false}; drawEvent(seed,ev);
+}
+function drawEvent(seed,ev){
+  let h=`<button class="x" onclick="evHolder._open=false;closeSheet()">✕</button><div class="kicker">${esc(L(ev.tag))}</div>`;
   h+=`<h3>${esc(L(ev.title))}</h3>`;
   if(ev.viz){ h+=miniChartSVG(ev.viz.kind,ev.viz.labels,ev.viz.series,ev.viz.cap,ev.viz.opts); }
   // lecture du signal : commentaire métier ambigu (jamais un verdict)
@@ -1556,10 +1720,34 @@ function openEvent(id){
     if(S.rankIdx>=2) h+=`<div class="analyst"><b>🧑‍💼 ${t("Note de l'équipe","Team note")} :</b> ${esc(L(ev.analyst))}</div>`;
     else h+=`<div class="analyst you"><b>👀 ${t("Ton analyse","Your read")} :</b> ${esc(L(ev.analyst))}</div>`;
   }
+  // pression hiérarchique : deux voix contradictoires, indépendantes de la vérité
+  if(seed.p){
+    if(!seed.pv){ seed.pv=[ri(0,PRESSURE.desk.length-1),ri(0,PRESSURE.comp.length-1)]; }
+    h+=`<div class="analyst" style="border-left-color:var(--gold)">💼 ${esc(L(PRESSURE.desk[seed.pv[0]]))}</div>`;
+    h+=`<div class="analyst" style="border-left-color:var(--liq)">🛡️ ${esc(L(PRESSURE.comp[seed.pv[1]]))}</div>`;
+    // analyse de modèle payante (indice imparfait ~75 %)
+    if(seed.hint){ h+=`<div class="analyst you" style="border-left-color:var(--brand)"><b>🧪 ${t("Sortie du modèle","Model output")} :</b> ${esc(L(seed.hint))}</div>`; }
+    else {
+      const cost=Math.round(totalAssets(S)*0.0006), left=S.modelRuns||0;
+      h+=`<button class="btn sec sm" style="margin:2px 0 6px" ${left<=0?"disabled":""} onclick="runModel('${seed.id}')">🧪 ${t("Faire tourner le modèle","Run the model")} (−${money(cost)} · ${left}/2 ${t("aujourd'hui","today")})</button>`;
+    }
+  }
   h+=`<div style="font-size:12px;color:var(--faint);margin:4px 2px 8px">${t("Information incomplète. À toi de trancher.","Incomplete information. Your call.")}</div>`;
   ev.choices.forEach((ch,k)=>{ h+=`<button class="choice" onclick="confirmChoice(${k})"><div class="cl">${esc(L(ch.l))}</div></button>`; });
   h+=`<button class="concept-item" style="width:100%;margin-top:6px" onclick="openConcept('${ev.concept}')"><span style="font-size:16px">📘</span><span class="ci-name">${t("Comprendre le concept","Understand the concept")}<small>${esc(L(conceptById(ev.concept).name))}</small></span><span class="arr mono">›</span></button>`;
-  openSheet(h);
+  showHeld(h,evHolder);
+}
+function runModel(seedId){
+  const seed=S.events.find(e=>e.id===seedId); if(!seed||!seed.p||(S.modelRuns||0)<=0||seed.hint)return;
+  S.modelRuns--; S.bs.cash-=Math.round(totalAssets(S)*0.0006); recalc(S);
+  const real=["building","acute","latent"].includes(seed.p.truth);
+  const tells=Math.random()<0.75 ? real : !real; // le modèle se trompe 1 fois sur 4
+  seed.hint=tells
+    ? B("Les simulations convergent vers un scénario adverse : la queue de distribution s'épaissit.","Simulations converge towards an adverse scenario: the tail is fattening.")
+    : B("Pas d'anomalie persistante : l'essentiel du mouvement ressemble à du bruit d'échantillonnage.","No persistent anomaly: most of the move looks like sampling noise.");
+  save();
+  const ev=eventFromSeed(seed); currentEvent={id:seedId,ev};
+  drawEvent(seed,ev);
 }
 function decisionVerdict(comp){
   if(comp>0.45) return {fr:"Arbitrage solide",en:"Solid call",col:"var(--good)"};
@@ -1570,6 +1758,7 @@ function decisionVerdict(comp){
 }
 function confirmChoice(k){
   const {id,ev}=currentEvent; const before=snapshot(S);
+  if(k<0)k=0; if(k>=ev.choices.length)k=ev.choices.length-1;
   const res=ev.choices[k].run(S)||{}; recalc(S); const after=snapshot(S);
   const TA=Math.max(totalAssets(S),1);
   // score composite multi-critères (capital, réputation, conformité, liquidité, rendement)
@@ -1581,6 +1770,19 @@ function confirmChoice(k){
   comp = clamp(comp,-1,1);
   const xp=clamp(Math.round(8+comp*6),3,16); addXP(xp); S.counters.eventsHandled++; if(S.today)S.today.events++;
   if(ev.concept){ learnConcept(ev.concept); srsReview(ev.concept, comp>=0?4:3); }
+  // relations : le desk aime le rendement, la conformité aime la prudence
+  const seedRef=S.events.find(e=>e.id===id);
+  if(LASTDECIDE){
+    S.rel=S.rel||{desk:60,comp:60};
+    const RM={defend:{desk:-3,comp:2},hedge:{desk:-1,comp:1},monitor:{desk:1,comp:-1},lean:{desk:3,comp:-3}}[LASTDECIDE.stance]||{desk:0,comp:0};
+    S.rel.desk=clamp(S.rel.desk+RM.desk,0,100); S.rel.comp=clamp(S.rel.comp+RM.comp,0,100);
+  }
+  // journal des décisions : la vérité sera révélée quelques jours plus tard
+  S.journal=S.journal||[];
+  const vd0=decisionVerdict(comp);
+  S.journal.push({d:S.day,mod:seedRef?seedRef.mod:"market",title:ev.title,choice:ev.choices[k].l,verdict:{fr:vd0.fr,en:vd0.en},stance:LASTDECIDE?LASTDECIDE.stance:null,truth:LASTDECIDE?LASTDECIDE.truth:null,rev:false});
+  if(S.journal.length>60)S.journal=S.journal.slice(-60);
+  LASTDECIDE=null;
   S.events=S.events.filter(e=>e.id!==id);
   checkMissions(); checkBadges(); save();
   const vd=decisionVerdict(comp);
@@ -1588,10 +1790,11 @@ function confirmChoice(k){
   h+=`<div style="font-weight:700;font-size:17px;color:${vd.col};margin:2px 0 8px">${t(vd.fr,vd.en)}</div>`;
   if(res.fb) h+=`<p style="font-size:14.5px;margin:0 0 8px">${esc(L(res.fb))}</p>`;
   if(res.delayed) h+=`<div class="analyst you" style="border-left-color:var(--warn)"><b>⏳ ${t("Effet différé","Delayed effect")} :</b> ${t("une partie des conséquences ne se matérialisera que dans les prochains jours. Ce verdict est provisoire.","part of the consequences will only materialise over the coming days. This verdict is provisional.")}</div>`;
+  const memoArr=MEMOS[seedRef?seedRef.mod:"market"]; if(memoArr){ h+=`<div class="analyst" style="border-left-color:var(--faint);font-size:12.5px"><b>📖 ${t("Contexte réglementaire","Regulatory context")} :</b> ${esc(L(pick(memoArr)))}</div>`; }
   h+=`<div class="dl">${deltaRows(before,after)}</div>`;
   h+=`<div style="text-align:right;font-family:var(--mono);color:var(--gold);font-size:13px">+${xp} XP</div>`;
   h+=`<div class="btnrow"><button class="btn sec sm" onclick="openConcept('${ev.concept}')">${t("Fiche liée","Linked card")}</button><button class="btn sm" onclick="closeSheet();refresh()">${t("Continuer","Continue")}</button></div>`;
-  closeSheet(); openSheet(h);
+  evHolder._open=false; closeSheet(); openSheet(h);
 }
 /* ---- crise ---- */
 function openCrisisSheet(cr){
@@ -1649,9 +1852,70 @@ function openStress(){
   h+=`<div class="btnrow"><button class="btn sec sm" onclick="openLossDist()">${t("Voir VaR/ES","See VaR/ES")}</button><button class="btn sm" onclick="closeSheet()">${t("Fermer","Close")}</button></div>`;
   openSheet(h);
 }
-/* ===================================================================
-   ÉCRANS
-   =================================================================== */
+/* ---- défi calibrage : un calcul sur le book réel, à faire avec les calculateurs ---- */
+let tcHolder={_open:false};
+function genToolChall(){
+  const kind=ri(0,2);
+  if(kind===0){ const pos=Math.round(riskyBook(S)), s=pick([1.2,1.5,2,2.5]);
+    return Object.assign(mkQ(`Ton book risqué vaut ${money(pos)}. Avec une volatilité journalière de ${s} %, quelle est sa VaR 99 % (z=2,33) ?`,`Your risky book is worth ${money(pos)}. With ${s}% daily volatility, what is its 99% VaR (z=2.33)?`,[pos*s/100*2.33,pos*s/100*1.645,pos*s/100,pos*s/100*2.33*3.16],fEUR,"VaR = position × σ × 2,33. Ouvre le calculateur VaR et entre TES chiffres.","VaR = position × σ × 2.33. Open the VaR calculator with YOUR numbers.","var_param",1),{tool:"openCalcVaR"});}
+  if(kind===1){ const ead=Math.round(S.bs.loansCorp), pd=+S.bookPD.toFixed(1), lgd=45;
+    return Object.assign(mkQ(`Tes prêts corporate : ${money(ead)}, PD du book ${pd} %, LGD 45 %. Perte attendue annuelle ?`,`Your corporate loans: ${money(ead)}, book PD ${pd}%, LGD 45%. Annual expected loss?`,[pd/100*lgd/100*ead,pd/100*ead,lgd/100*ead,pd/100*lgd/100*ead*10],fEUR,"EL = PD × LGD × EAD avec TES chiffres — le calculateur EL fait exactement ça.","EL = PD × LGD × EAD with YOUR numbers — the EL calculator does exactly this.","el",1),{tool:"openCalcEL"});}
+  const V=Math.round(S.bs.securities), D=pick([4,5,6,7]), bp=pick([100,150,200]);
+  return Object.assign(mkQ(`Ton portefeuille de titres : ${money(V)}, duration ${D}. Si les taux montent de ${bp} bp, Δ valeur ?`,`Your securities: ${money(V)}, duration ${D}. If rates rise ${bp} bp, value change?`,[-D*bp/10000*V,D*bp/10000*V,-D*bp/10000*V/10,-bp/10000*V],fEUR,"ΔP = −D × Δy × P avec TES chiffres — le calculateur Duration est fait pour ça.","ΔP = −D × Δy × P with YOUR numbers — the Duration calculator is built for this.","duration",1),{tool:"openCalcDur"});
+}
+function openToolChall(){
+  if(S.toolChall&&S.toolChall.done)return;
+  if(!S.toolChall) { S.toolChall={q:genToolChall(),pick:-1,done:false}; save(); }
+  tcHolder={_open:false}; drawToolChall();
+}
+function drawToolChall(){
+  const tc=S.toolChall, q=tc.q;
+  let h=`<button class="x" onclick="tcHolder._open=false;closeSheet()">✕</button><div class="kicker">🎯 ${t("Défi calibrage du jour","Daily calibration challenge")}</div>`;
+  h+=`<h3 style="font-size:16.5px">${esc(L(q.q))}</h3>`;
+  h+=`<div class="btnrow" style="margin:4px 0 8px"><button class="btn sec sm" onclick="${q.tool}()">🧮 ${t("Ouvrir le bon calculateur","Open the right calculator")}</button></div>`;
+  q.opts.forEach((o,k)=>{ let cls=""; if(tc.done){ if(k===q.correct)cls="right"; else if(k===tc.pick)cls="wrong"; } h+=`<button class="qopt ${cls}" onclick="tcAnswer(${k})"><span class="qk">${String.fromCharCode(65+k)}</span><span>${esc(L(o))}</span></button>`; });
+  if(tc.done){ const ok=tc.pick===q.correct;
+    h+=`<div class="qfb ${ok?'ok':'no'}">${ok?'✓ '+t("Bonus de calibrage : ","Calibration bonus: ")+money(Math.round(totalAssets(S)*0.002))+" · +20 XP":'✕ '+esc(L(q.exp))}</div><button class="btn sm" onclick="tcHolder._open=false;closeSheet();refresh()">${t("Fermer","Close")}</button>`; }
+  showHeld(h,tcHolder);
+}
+function tcAnswer(k){
+  const tc=S.toolChall; if(!tc||tc.done)return;
+  tc.pick=k; tc.done=true;
+  const ok=k===tc.q.correct;
+  if(ok){ S.bs.cash+=Math.round(totalAssets(S)*0.002); addXP(20); recalc(S); }
+  else addXP(5);
+  if(tc.q.concept&&conceptById(tc.q.concept)){ srsReview(tc.q.concept, ok?5:2); learnConcept(tc.q.concept); }
+  save(); drawToolChall();
+}
+/* ---- journal des décisions : relecture avec vérité révélée ---- */
+function openJournal(){
+  const J=(S.journal||[]).slice(-25).reverse();
+  let h=`<button class="x" onclick="closeSheet()">✕</button><div class="kicker">📓 ${t("Journal des décisions","Decision journal")}</div>`;
+  h+=`<p style="font-size:12.5px;color:var(--muted);margin:2px 0 8px">${t("La vraie nature de chaque signal se révèle ~6 jours après ta décision. C'est ici qu'on apprend.","Each signal's true nature is revealed ~6 days after your call. This is where you learn.")}</p>`;
+  if(!J.length) h+=`<div class="card center" style="color:var(--muted)">${t("Aucune décision enregistrée pour l'instant.","No decisions recorded yet.")}</div>`;
+  J.forEach(j=>{
+    const tl=j.truth?TRUTH_LABELS[j.truth]:null;
+    h+=`<div class="card" style="margin-bottom:8px;padding:10px 12px">
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted)"><span>${t("Jour","Day")} ${j.d}</span><span>${esc(L(j.verdict||{fr:"",en:""}))}</span></div>
+      <div style="font-weight:600;font-size:13.5px;margin:2px 0">${esc(L(j.title))}</div>
+      <div style="font-size:12.5px;color:var(--muted)">→ ${esc(L(j.choice))}</div>
+      ${j.rev&&tl?`<div style="font-size:12px;margin-top:4px;color:${tl.col}">🔎 ${t("Réalité :","Reality:")} ${esc(t(tl.fr,tl.en))}</div>`:(j.truth?`<div style="font-size:12px;margin-top:4px;color:var(--faint)">⏳ ${t("Vérité pas encore révélée","Truth not yet revealed")}</div>`:"")}
+    </div>`;
+  });
+  h+=`<button class="btn sec sm" onclick="closeSheet()">${t("Fermer","Close")}</button>`;
+  openSheet(h);
+}
+/* ---- semaine de stress scénarisée ---- */
+function startStressWeek(){
+  if(S.stressW||S.survival)return;
+  S.stressW={left:7,startCap:S.metrics.capital};
+  save();
+  let h=`<button class="x" onclick="closeSheet();refresh()">✕</button><div class="kicker" style="color:var(--warn)">⚡ ${t("Semaine de stress","Stress week")}</div>`;
+  h+=`<h3>${t("7 jours sous tension","7 days under pressure")}</h3>`;
+  h+=`<p style="font-size:13.5px">${t("Inspiré des épisodes réels : fuite lente des dépôts, signaux de marché et de liquidité plus souvent réels qu'à l'ordinaire. Objectif : finir la semaine sans entamer ton capital de plus de 15 %.","Inspired by real episodes: slow deposit leak, market and liquidity signals more often real than usual. Goal: end the week without denting capital by more than 15%.")}</p>`;
+  h+=`<button class="btn warn" onclick="closeSheet();refresh()">${t("C'est parti","Let's go")}</button>`;
+  openSheet(h);
+}
 let VIEW="dashboard";
 function go(v){ VIEW=v; closeAllSheets(); render(); window.scrollTo(0,0); }
 function refresh(){ render(); }
@@ -1710,6 +1974,11 @@ function renderDashboard(){
   if(S.survival){
     h+=`<div class="survival"><div class="sv-t">🛡️ ${t("Mode survie","Survival mode")} — ${t("Jour","Day")} ${30-S.survival.daysLeft+1}/30</div><p style="margin:6px 0;font-size:13.5px">${t("Répliques en cours. Réduis le risque et tiens bon.","Aftershocks ongoing. Cut risk and hold on.")}</p><div class="exam-prog"><div style="width:${(30-S.survival.daysLeft)/30*100}%;background:var(--warn)"></div></div></div>`;
   }
+  if(S.stressW){
+    h+=`<div class="survival" style="border-color:var(--warn)"><div class="sv-t">⚡ ${t("Semaine de stress","Stress week")} — ${t("jour","day")} ${8-S.stressW.left}/7</div><p style="margin:6px 0;font-size:13px">${t("Dépôts sous pression, signaux plus souvent réels. Capital de départ :","Deposits under pressure, signals more often real. Starting capital:")} ${money(S.stressW.startCap)}</p><div class="exam-prog"><div style="width:${(7-S.stressW.left)/7*100}%;background:var(--warn)"></div></div></div>`;
+  } else if(S.rankIdx>=3 && !S.survival){
+    h+=`<button class="btn sec sm" style="width:100%;margin:2px 0 6px;border-color:var(--warn)" onclick="startStressWeek()">⚡ ${t("Lancer une semaine de stress (défi, rang 4+)","Start a stress week (challenge, rank 4+)")}</button>`;
+  }
   // bilan
   h+=`<div class="section"><h2>${t("Bilan","Balance sheet")}</h2>${balanceSheetBar()}</div>`;
   // métriques
@@ -1757,9 +2026,12 @@ function renderGuide(){
   h+=`<div id="gsearchres"></div>`;
   h+=`<div class="calc-out" style="border-color:var(--gold)"><div class="co-v" style="color:var(--gold)">${readiness()}%</div><div class="co-l">${t("Préparation FRM estimée","Estimated FRM readiness")} · ${S.learned.length}/${CONCEPTS.length} ${t("concepts","concepts")}</div></div>`;
   h+=`<div class="row2" style="margin-top:12px"><button class="btn" onclick="startExam()">📝 ${t("Examen blanc","Mock exam")}</button><button class="btn sec" onclick="startReview()">🔁 ${t("Révision du jour","Daily review")}</button></div>`;
+  if(S.examSession) h+=`<button class="btn" style="width:100%;margin-top:8px;border-color:var(--gold)" onclick="resumeExam()">▶️ ${t("Reprendre la session en cours","Resume current session")} (${S.examSession.idx+1}/${S.examSession.qs.length})</button>`;
   const due=dueReviews().length;
   h+=`<div class="center" style="font-size:12px;color:var(--muted);margin-top:8px">${due?(due+" "+t("fiche(s) à réviser aujourd'hui","card(s) due today")):t("Aucune révision due — reviens demain.","No reviews due — come back tomorrow.")} · ${t("Meilleur examen","Best exam")} ${S.examBest}%</div>`;
   h+=`<div class="toolgrid" style="margin-top:12px"><div class="tool" onclick="openCalcVaR()"><div class="ti2">🧮</div><div class="tn">VaR</div></div><div class="tool" onclick="openCalcEL()"><div class="ti2">💳</div><div class="tn">EL</div></div><div class="tool" onclick="openCalcDur()"><div class="ti2">📏</div><div class="tn">Duration</div></div><div class="tool" onclick="openStress()"><div class="ti2">🔥</div><div class="tn">${t("Stress","Stress")}</div></div></div>`;
+  const tc=S.toolChall;
+  h+=`<button class="btn ${tc&&tc.done?'sec':''}" style="width:100%;margin-top:10px" ${tc&&tc.done?"disabled":""} onclick="openToolChall()">🎯 ${t("Défi calibrage du jour","Daily calibration challenge")}${tc&&tc.done?" ✓":""}<div style="font-size:10.5px;font-weight:400;margin-top:2px;color:var(--muted)">${t("Un calcul sur TON book réel — sers-toi des calculateurs. Bonus de capital à la clé.","One calculation on YOUR actual book — use the calculators. Capital bonus at stake.")}</div></button>`;
   h+=`</div>`;
   h+=`<div class="section"><h2>${t("Modules du curriculum","Curriculum modules")}</h2>`;
   MODULES.forEach(m=>{ const mast=Math.round(topicMastery(m.id)*100); const cnt=CONCEPTS.filter(c=>c.mod===m.id).length;
@@ -1797,6 +2069,34 @@ function renderReport(){
     <div class="r"><span class="k">${t("Promotions","Promotions")}</span><span class="v">${c.promotions}</span></div>
     <div class="r"><span class="k">${t("Recapitalisations","Recapitalisations")}</span><span class="v">${c.recaps}</span></div>
   </div></div>`;
+  // relations internes
+  const rel=S.rel||{desk:60,comp:60};
+  const relBar=(v,col)=>`<div style="height:7px;border-radius:4px;background:var(--card2,rgba(255,255,255,.06));overflow:hidden"><div style="width:${v}%;height:100%;background:${col}"></div></div>`;
+  h+=`<div class="section"><h2>${t("Relations internes","Internal relationships")}</h2><div class="card">
+    <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:3px"><span>💼 ${t("Desk / front office","Desk / front office")}</span><span class="mono">${Math.round(rel.desk)}</span></div>${relBar(rel.desk,"var(--gold)")}
+    <div style="display:flex;justify-content:space-between;font-size:12.5px;margin:8px 0 3px"><span>🛡️ ${t("Conformité / 2e ligne","Compliance / 2nd line")}</span><span class="mono">${Math.round(rel.comp)}</span></div>${relBar(rel.comp,"var(--liq)")}
+    <div style="font-size:11px;color:var(--muted);margin-top:6px">${t("Un desk hostile (<35) pèse sur le rendement ; une conformité hostile abaisse le seuil d'inspection.","A hostile desk (<35) drags returns; hostile compliance lowers the inspection threshold.")}</div></div></div>`;
+  // dossier réglementaire
+  const reg=S.reg||{breaches:0,fines:0,lastInsp:0};
+  h+=`<div class="section"><h2>⚖️ ${t("Dossier réglementaire","Regulatory file")}</h2><div class="dl">
+    <div class="r"><span class="k">${t("Dépassements au dossier","Breaches on file")}</span><span class="v" style="color:${reg.breaches>=5?'var(--crit)':reg.breaches>=3?'var(--warn)':'var(--good)'}">${reg.breaches}</span></div>
+    <div class="r"><span class="k">${t("Amendes reçues","Fines received")}</span><span class="v">${reg.fines}</span></div>
+  </div><div style="font-size:11px;color:var(--muted);margin-top:4px">${t("Chaque jour non conforme (capital/LCR) s'ajoute au dossier. Trop de dépassements → inspection, amende et réputation entaillée.","Each non-compliant day (capital/LCR) adds to the file. Too many breaches → inspection, fine and dented reputation.")}</div></div>`;
+  // bilan de carrière : tes biais de décision
+  const J=(S.journal||[]).filter(j=>j.stance);
+  if(J.length>=5){
+    const prud=J.filter(j=>j.stance==="defend"||j.stance==="hedge").length;
+    const real=J.filter(j=>j.rev&&["building","acute","latent"].includes(j.truth));
+    const fake=J.filter(j=>j.rev&&(j.truth==="calm"||j.truth==="falseAlarm"));
+    const prot=real.length?Math.round(real.filter(j=>j.stance==="defend"||j.stance==="hedge").length/real.length*100):null;
+    const over=fake.length?Math.round(fake.filter(j=>j.stance==="defend"||j.stance==="hedge").length/fake.length*100):null;
+    h+=`<div class="section"><h2>🪞 ${t("Bilan de carrière — tes biais","Career debrief — your biases")}</h2><div class="dl">
+      <div class="r"><span class="k">${t("Profil de décision","Decision profile")}</span><span class="v">${Math.round(prud/J.length*100)}% ${t("prudent","cautious")}</span></div>
+      ${prot!=null?`<div class="r"><span class="k">${t("Vrais risques couverts","Real risks protected")}</span><span class="v" style="color:${prot>=60?'var(--good)':'var(--warn)'}">${prot}%</span></div>`:""}
+      ${over!=null?`<div class="r"><span class="k">${t("Sur-réaction aux faux signaux","Overreaction to false alarms")}</span><span class="v" style="color:${over<=50?'var(--good)':'var(--warn)'}">${over}%</span></div>`:""}
+    </div><div style="font-size:11px;color:var(--muted);margin-top:4px">${t("Le bon risk manager couvre les vrais risques SANS sur-payer les faux signaux. Les deux pourcentages se lisent ensemble.","A good risk manager covers real risks WITHOUT overpaying for false alarms. Read both percentages together.")}</div></div>`;
+  }
+  h+=`<div class="section"><button class="btn sec" style="width:100%" onclick="openJournal()">📓 ${t("Journal des décisions (vérités révélées)","Decision journal (truths revealed)")}</button></div>`;
   h+=tabBar(); return h;
 }
 function renderSettings(){
@@ -1861,7 +2161,7 @@ function render(){
 function boot(){
   app=$("app");
   const had=load();
-  if(had){ if(!S.pending)S.pending=[]; if(S.metrics&&S.metrics.reputation==null)S.metrics.reputation=72; if(S.counters&&S.counters.tasksDone==null)S.counters.tasksDone=0; if(!S.v3realism){ genDay(S); S.v3realism=true; } else { if(!S.today)genDay(S); if(!S.bossTasks)genBossTasks(S); } applyTheme(); VIEW="dashboard"; }
+  if(had){ if(!S.pending)S.pending=[]; if(S.metrics&&S.metrics.reputation==null)S.metrics.reputation=72; if(S.counters&&S.counters.tasksDone==null)S.counters.tasksDone=0; if(!S.rel)S.rel={desk:60,comp:60}; if(!S.reg)S.reg={breaches:0,fines:0,lastInsp:0}; if(!S.journal)S.journal=[]; if(!S.chains)S.chains=[]; if(S.modelRuns==null)S.modelRuns=2; if(S.stressW===undefined)S.stressW=null; if(S.toolChall===undefined)S.toolChall=null; if(!S.v3realism){ genDay(S); S.v3realism=true; } else { if(!S.today)genDay(S); if(!S.bossTasks)genBossTasks(S); } applyTheme(); VIEW="dashboard"; }
   else { S=null; }
   render();
   if("serviceWorker" in navigator){ try{ navigator.serviceWorker.register("sw.js"); }catch(e){} }
@@ -1947,7 +2247,11 @@ const FB={
         lean:B("Rien de visible, sauf que tu as chargé sur un risque caché. Ça se paiera plus tard.","Nothing visible — except you loaded onto a hidden risk. It will cost you later.") }
 };
 function decideFunding(s,p,stance,cfg){
+  LASTDECIDE={stance,truth:p.truth};
   const real=isReal(p.truth), frac=sevFrac(p.truth); let rend=0,rep=0,delayed=false;
+  if(real&&(stance==="monitor"||stance==="lean")&&Math.random()<0.45&&s===S){
+    S.chains=S.chains||[]; S.chains.push({day:S.day+ri(2,5),mod:pick(decisionMods())});
+  }
   if(stance==="defend"){ const m=s.bs.securities*0.3; s.bs.securities-=m; s.bs.hqla+=m; rend-=0.4; rep+=0.5; }
   else if(stance==="hedge"){ s.bs.wholesale*=0.9; s.bs.deposits*=1.0; rend-=0.2; }
   else if(stance==="lean"){ const m=s.bs.hqla*0.3; s.bs.hqla-=m; s.bs.securities+=m; rend+=0.3; rep-=1; }
@@ -1959,8 +2263,12 @@ function decideFunding(s,p,stance,cfg){
   return {fb:FB[p.truth][stance], delayed};
 }
 function decide(s,p,stance,cfg){
+  LASTDECIDE={stance,truth:p.truth};
   if(cfg.funding) return decideFunding(s,p,stance,cfg);
   const real=isReal(p.truth), frac0=sevFrac(p.truth); let rend=0,rep=0,delayed=false,frac=frac0;
+  if(real&&(stance==="monitor"||stance==="lean")&&Math.random()<0.45&&s===S){
+    S.chains=S.chains||[]; S.chains.push({day:S.day+ri(2,5),mod:pick(decisionMods().filter(m=>m!==p.mod))});
+  }
   if(stance==="defend"){
     if(cfg.declineDefend){ rend-=0.1; rep+=0.6; frac=0; }
     else { const cut=s.bs[cfg.line]*0.25; s.bs[cfg.line]-=cut; s.bs.cash+=cut*0.992; rend-=0.4; rep+=1; frac=frac0*0.15; }
@@ -1997,7 +2305,15 @@ const DECISIONS={
    choices:[ {l:B("Réduire le book de 25 %","Cut the book by 25%"),run:s=>decide(s,p,"defend",{line:"securities",sec:{rhoAdd:0.04},delayFr:"Le risque de marché se matérialise : le book décroche.",delayEn:"Market risk materialises: the book sells off."})},
     {l:B("Couvrir via futures","Hedge via futures"),run:s=>decide(s,p,"hedge",{line:"securities",hedgeType:"future",sec:{rhoAdd:0.04}})},
     {l:B("Maintenir les positions","Hold positions"),run:s=>decide(s,p,"monitor",{line:"securities",sec:{rhoAdd:0.04},delayFr:"Le risque de marché se matérialise : le book décroche.",delayEn:"Market risk materialises: the book sells off."})},
-    {l:B("Renforcer l'exposition","Add exposure"),run:s=>decide(s,p,"lean",{line:"securities",sec:{rhoAdd:0.05},delayFr:"Le risque de marché se matérialise : pertes amplifiées.",delayEn:"Market risk materialises: amplified losses."})} ]}) ],
+    {l:B("Renforcer l'exposition","Add exposure"),run:s=>decide(s,p,"lean",{line:"securities",sec:{rhoAdd:0.05},delayFr:"Le risque de marché se matérialise : pertes amplifiées.",delayEn:"Market risk materialises: amplified losses."})} ]}),
+  (p)=>({concept:"duration",dot:"var(--market)",tag:B("Risque de taux","Rates risk"),
+   title:B("Book obligataire — exposition aux taux","Bond book — rates exposure"),
+   viz:vizL(p,"var(--market)","Sensibilité taux du book (DV01, k€)","Book rate sensitivity (DV01, €k)","limite DV01","DV01 limit"),
+   analyst:pick(ANALYSTS),
+   choices:[ {l:B("Réduire la duration (vendre du long)","Cut duration (sell long end)"),run:s=>decide(s,p,"defend",{line:"securities",sec:{rhoAdd:0.03},delayFr:"Choc de taux : le book obligataire encaisse.",delayEn:"Rate shock: the bond book takes the hit."})},
+    {l:B("Couvrir par swaps de taux","Hedge with rate swaps"),run:s=>decide(s,p,"hedge",{line:"securities",hedgeType:"future",sec:{rhoAdd:0.03}})},
+    {l:B("Conserver la duration","Keep the duration"),run:s=>decide(s,p,"monitor",{line:"securities",sec:{rhoAdd:0.03},delayFr:"Choc de taux : pertes mark-to-market.",delayEn:"Rate shock: mark-to-market losses."})},
+    {l:B("Allonger la duration (chercher du portage)","Extend duration (reach for carry)"),run:s=>decide(s,p,"lean",{line:"securities",sec:{rhoAdd:0.04},delayFr:"Choc de taux violent sur un book rallongé.",delayEn:"Violent rate shock on an extended book."})} ]}) ],
  credit:[ (p)=>({concept:"el",dot:"var(--credit)",tag:B("Risque de crédit","Credit risk"),
    title:B("Dossier corporate de "+money(p.a),"Corporate file of "+money(p.a)),
    viz:vizL(p,"var(--credit)","Défauts du secteur (pb)","Sector defaults (bps)","seuil d'alerte","alert level"),
@@ -2005,7 +2321,15 @@ const DECISIONS={
    choices:[ {l:B("Refuser le dossier","Decline the file"),run:s=>decide(s,p,"defend",{line:"loansCorp",declineDefend:true})},
     {l:B("Accorder avec collatéral","Approve with collateral"),run:s=>decide(s,p,"hedge",{line:"loansCorp",addExposure:true,amount:p.a,lgdAdd:-4,sec:{pdMul:1.15},delayFr:"Le crédit se dégrade : provisions à passer.",delayEn:"The credit deteriorates: provisions to book."})},
     {l:B("Accorder en l'état","Approve as is"),run:s=>decide(s,p,"monitor",{line:"loansCorp",addExposure:true,amount:p.a,counts:true,sec:{pdMul:1.25},delayFr:"Le crédit se dégrade : provisions à passer.",delayEn:"The credit deteriorates: provisions to book."})},
-    {l:B("Augmenter la ligne sectorielle","Scale up the sector line"),run:s=>decide(s,p,"lean",{line:"loansCorp",addExposure:true,amount:p.a,sec:{pdMul:1.35},delayFr:"Défauts corrélés sur le secteur concentré.",delayEn:"Correlated defaults across the concentrated sector."})} ]}) ],
+    {l:B("Augmenter la ligne sectorielle","Scale up the sector line"),run:s=>decide(s,p,"lean",{line:"loansCorp",addExposure:true,amount:p.a,sec:{pdMul:1.35},delayFr:"Défauts corrélés sur le secteur concentré.",delayEn:"Correlated defaults across the concentrated sector."})} ]}),
+  (p)=>({concept:"concentration",dot:"var(--credit)",tag:B("Risque de crédit","Credit risk"),
+   title:B("Concentration sectorielle — immobilier commercial","Sector concentration — commercial real estate"),
+   viz:vizL(p,"var(--credit)","Part du secteur dans le book (%)","Sector share of the book (%)","plafond interne","internal cap"),
+   analyst:pick(ANALYSTS),
+   choices:[ {l:B("Geler les nouveaux engagements","Freeze new commitments"),run:s=>decide(s,p,"defend",{line:"loansCorp",declineDefend:true})},
+    {l:B("Plafonner et exiger plus de collatéral","Cap and demand more collateral"),run:s=>decide(s,p,"hedge",{line:"loansCorp",lgdAdd:-3,sec:{pdMul:1.15},delayFr:"Le secteur se retourne : provisions limitées par le collatéral.",delayEn:"The sector turns: provisions limited by collateral."})},
+    {l:B("Maintenir la stratégie sectorielle","Keep the sector strategy"),run:s=>decide(s,p,"monitor",{line:"loansCorp",sec:{pdMul:1.3},delayFr:"Retournement sectoriel : défauts corrélés.",delayEn:"Sector downturn: correlated defaults."})},
+    {l:B("Profiter des marges du secteur","Chase the sector's margins"),run:s=>decide(s,p,"lean",{line:"loansCorp",addExposure:true,amount:p.a,sec:{pdMul:1.4},delayFr:"Choc sectoriel sur un book sur-concentré.",delayEn:"Sector shock on an over-concentrated book."})} ]}) ],
  liquidity:[ (p)=>({concept:"lcr",dot:"var(--liq)",tag:B("Liquidité","Liquidity"),
    title:B("Trésorerie — dynamique des dépôts","Treasury — deposit dynamics"),
    viz:{kind:"line",labels:["S‑7","S‑6","S‑5","S‑4","S‑3","S‑2","S‑1","auj."],series:[{color:"var(--liq)",values:p.series.map(v=>Math.round(p.series[0]*2-v))}],cap:B("Solde des dépôts (indice)","Deposit balance (index)"),opts:{compare:p.prev.map(v=>Math.round(p.series[0]*2-v)),highlightLast:true}},
@@ -2013,7 +2337,15 @@ const DECISIONS={
    choices:[ {l:B("Renforcer le coussin HQLA","Build the HQLA buffer"),run:s=>decide(s,p,"defend",{funding:true})},
     {l:B("Allonger le financement","Term out funding"),run:s=>decide(s,p,"hedge",{funding:true})},
     {l:B("Statu quo","Status quo"),run:s=>decide(s,p,"monitor",{funding:true})},
-    {l:B("Replacer le cash en titres","Redeploy cash into securities"),run:s=>decide(s,p,"lean",{funding:true})} ]}) ],
+    {l:B("Replacer le cash en titres","Redeploy cash into securities"),run:s=>decide(s,p,"lean",{funding:true})} ]}),
+  (p)=>({concept:"funding_liq",dot:"var(--liq)",tag:B("Liquidité","Liquidity"),
+   title:B("Lignes confirmées — risque de tirage","Committed lines — drawdown risk"),
+   viz:vizL(p,"var(--liq)","Tirages sur lignes confirmées (M€)","Drawdowns on committed lines (€M)","capacité","capacity"),
+   analyst:pick(ANALYSTS),
+   choices:[ {l:B("Pré-financer : monter le coussin HQLA","Pre-fund: build the HQLA buffer"),run:s=>decide(s,p,"defend",{funding:true})},
+    {l:B("Sécuriser du financement à terme","Secure term funding"),run:s=>decide(s,p,"hedge",{funding:true})},
+    {l:B("Compter sur le marché interbancaire","Rely on the interbank market"),run:s=>decide(s,p,"monitor",{funding:true})},
+    {l:B("Réduire le coussin (coût d'opportunité)","Shrink the buffer (opportunity cost)"),run:s=>decide(s,p,"lean",{funding:true})} ]}) ],
  op:[ (p)=>({concept:"oprisk",dot:"var(--op)",tag:B("Risque opérationnel","Operational risk"),
    title:B("Incidents opérationnels — revue mensuelle","Operational incidents — monthly review"),
    viz:{kind:"bar",labels:LBLM,series:[{color:"var(--op)",values:p.series}],cap:B("Incidents / tentatives par mois","Incidents / attempts per month"),opts:{threshold:p.threshold,thLabel:B("seuil","threshold")}},
@@ -2021,7 +2353,15 @@ const DECISIONS={
    choices:[ {l:B("Investir dans les contrôles","Invest in controls"),run:s=>decide(s,p,"defend",{line:"cash",lossKind:"absCash",sec:{opMul:0.8},delayFr:"Incident opérationnel : perte encaissée.",delayEn:"Operational incident: loss taken."})},
     {l:B("Souscrire une assurance","Take out insurance"),run:s=>decide(s,p,"hedge",{line:"cash",lossKind:"absCash",sec:{opMul:0.95},delayFr:"Incident opérationnel : perte partiellement assurée.",delayEn:"Operational incident: partially insured loss."})},
     {l:B("Maintenir le dispositif","Keep the current setup"),run:s=>decide(s,p,"monitor",{line:"cash",lossKind:"absCash",sec:{opMul:1.1},delayFr:"Incident opérationnel : perte encaissée.",delayEn:"Operational incident: loss taken."})},
-    {l:B("Réduire le budget contrôle","Cut the controls budget"),run:s=>decide(s,p,"lean",{line:"cash",lossKind:"absCash",sec:{opMul:1.3},delayFr:"Incident opérationnel majeur : lourde perte.",delayEn:"Major operational incident: heavy loss."})} ]}) ],
+    {l:B("Réduire le budget contrôle","Cut the controls budget"),run:s=>decide(s,p,"lean",{line:"cash",lossKind:"absCash",sec:{opMul:1.3},delayFr:"Incident opérationnel majeur : lourde perte.",delayEn:"Major operational incident: heavy loss."})} ]}),
+  (p)=>({concept:"kri",dot:"var(--op)",tag:B("Risque opérationnel","Operational risk"),
+   title:B("Alerte cyber — tentatives d'intrusion","Cyber alert — intrusion attempts"),
+   viz:{kind:"bar",labels:LBLM,series:[{color:"var(--op)",values:p.series}],cap:B("Tentatives détectées / mois","Detected attempts / month"),opts:{threshold:p.threshold,thLabel:B("seuil KRI","KRI level")}},
+   analyst:pick(ANALYSTS),
+   choices:[ {l:B("Audit de sécurité + correctifs immédiats","Security audit + immediate patches"),run:s=>decide(s,p,"defend",{line:"cash",lossKind:"absCash",sec:{opMul:0.8},delayFr:"Attaque réussie : pertes et coûts de remédiation.",delayEn:"Successful attack: losses and remediation costs."})},
+    {l:B("Cyber-assurance + surveillance renforcée","Cyber insurance + tighter monitoring"),run:s=>decide(s,p,"hedge",{line:"cash",lossKind:"absCash",sec:{opMul:0.95},delayFr:"Attaque réussie : perte partiellement assurée.",delayEn:"Successful attack: partially insured loss."})},
+    {l:B("Considérer l'alerte comme du bruit","Treat the alert as noise"),run:s=>decide(s,p,"monitor",{line:"cash",lossKind:"absCash",sec:{opMul:1.15},delayFr:"Intrusion réussie : fraude et indisponibilité.",delayEn:"Successful intrusion: fraud and downtime."})},
+    {l:B("Reporter le budget cyber au prochain exercice","Defer the cyber budget to next year"),run:s=>decide(s,p,"lean",{line:"cash",lossKind:"absCash",sec:{opMul:1.35},delayFr:"Attaque majeure sur un dispositif vieillissant.",delayEn:"Major attack on an ageing setup."})} ]}) ],
  counterparty:[ (p)=>({concept:"cva",dot:"var(--cp)",tag:B("Contrepartie","Counterparty"),
    title:B("Exposition sur une contrepartie dérivés","Exposure to a derivatives counterparty"),
    viz:vizL(p,"var(--cp)","Spread CDS de la contrepartie (pb)","Counterparty CDS spread (bps)","seuil interne","internal limit"),
@@ -2029,7 +2369,15 @@ const DECISIONS={
    choices:[ {l:B("Exiger collatéral / netting","Require collateral / netting"),run:s=>decide(s,p,"defend",{line:"deriv",sec:{cpMul:1.2}})},
     {l:B("Acheter une protection CDS","Buy CDS protection"),run:s=>decide(s,p,"hedge",{line:"deriv",hedgeType:"cds",sec:{cpMul:1.2}})},
     {l:B("Maintenir la ligne","Keep the line"),run:s=>decide(s,p,"monitor",{line:"deriv",sec:{cpMul:1.4},delayFr:"La contrepartie fait défaut : exposition nette frappée.",delayEn:"The counterparty defaults: net exposure hit."})},
-    {l:B("Étendre la ligne","Extend the line"),run:s=>decide(s,p,"lean",{line:"deriv",sec:{cpMul:1.5},delayFr:"Défaut de contrepartie sur une ligne accrue.",delayEn:"Counterparty default on an enlarged line."})} ]}) ],
+    {l:B("Étendre la ligne","Extend the line"),run:s=>decide(s,p,"lean",{line:"deriv",sec:{cpMul:1.5},delayFr:"Défaut de contrepartie sur une ligne accrue.",delayEn:"Counterparty default on an enlarged line."})} ]}),
+  (p)=>({concept:"netting",dot:"var(--cp)",tag:B("Contrepartie","Counterparty"),
+   title:B("Appel de marge contesté par un hedge fund","Margin call disputed by a hedge fund"),
+   viz:vizL(p,"var(--cp)","Exposition non collatéralisée (M€)","Uncollateralised exposure (€M)","seuil de marge","margin threshold"),
+   analyst:pick(ANALYSTS),
+   choices:[ {l:B("Exiger la marge sous 24 h, sinon clôture","Demand margin within 24h or close out"),run:s=>decide(s,p,"defend",{line:"deriv",sec:{cpMul:1.2}})},
+    {l:B("Négocier un échéancier + protection CDS","Negotiate a schedule + CDS protection"),run:s=>decide(s,p,"hedge",{line:"deriv",hedgeType:"cds",sec:{cpMul:1.2}})},
+    {l:B("Accorder un délai commercial","Grant a commercial grace period"),run:s=>decide(s,p,"monitor",{line:"deriv",sec:{cpMul:1.4},delayFr:"Le fonds fait défaut : exposition non margée frappée.",delayEn:"The fund defaults: unmargined exposure hit."})},
+    {l:B("Relever le seuil de marge du client","Raise the client's margin threshold"),run:s=>decide(s,p,"lean",{line:"deriv",sec:{cpMul:1.55},delayFr:"Défaut sur une exposition volontairement sous-margée.",delayEn:"Default on a deliberately under-margined exposure."})} ]}) ],
  deriv:[ (p)=>({concept:"delta",dot:"var(--brand)",tag:B("Dérivés / Greeks","Derivatives / Greeks"),
    title:B("Book d'options — gestion du delta","Options book — delta management"),
    viz:vizL(p,"var(--brand)","Delta net du book","Book net delta","limite delta","delta limit",LBLH),
@@ -2037,55 +2385,226 @@ const DECISIONS={
    choices:[ {l:B("Delta-hedger maintenant","Delta-hedge now"),run:s=>decide(s,p,"hedge",{line:"deriv",hedgeType:"future",sec:{rhoAdd:0.03}})},
     {l:B("Acheter des puts","Buy puts"),run:s=>decide(s,p,"defend",{line:"deriv",sec:{rhoAdd:0.02}})},
     {l:B("Laisser le book ouvert","Leave the book open"),run:s=>decide(s,p,"monitor",{line:"deriv",sec:{rhoAdd:0.03},delayFr:"Le sous-jacent bouge : le delta non couvert coûte.",delayEn:"The underlying moves: the uncovered delta bites."})},
-    {l:B("Augmenter le levier","Add leverage"),run:s=>decide(s,p,"lean",{line:"deriv",sec:{rhoAdd:0.04},delayFr:"Mouvement adverse sur un book à fort levier.",delayEn:"Adverse move on a high-leverage book."})} ]}) ],
+    {l:B("Augmenter le levier","Add leverage"),run:s=>decide(s,p,"lean",{line:"deriv",sec:{rhoAdd:0.04},delayFr:"Mouvement adverse sur un book à fort levier.",delayEn:"Adverse move on a high-leverage book."})} ]}),
+  (p)=>({concept:"vega",dot:"var(--brand)",tag:B("Dérivés / Greeks","Derivatives / Greeks"),
+   title:B("Book d'options — vega court avant annonces","Options book — short vega into announcements"),
+   viz:vizL(p,"var(--brand)","Volatilité implicite (points)","Implied volatility (points)","niveau d'alerte","alert level",LBLH),
+   analyst:pick(ANALYSTS),
+   choices:[ {l:B("Racheter le vega court","Buy back the short vega"),run:s=>decide(s,p,"defend",{line:"deriv",sec:{rhoAdd:0.02}})},
+    {l:B("Acheter des options longues en couverture","Buy long options as a hedge"),run:s=>decide(s,p,"hedge",{line:"deriv",hedgeType:"put",sec:{rhoAdd:0.02}})},
+    {l:B("Garder la position courte de volatilité","Keep the short-vol position"),run:s=>decide(s,p,"monitor",{line:"deriv",sec:{rhoAdd:0.03},delayFr:"La volatilité explose : le vega court coûte cher.",delayEn:"Volatility spikes: short vega bites hard."})},
+    {l:B("Vendre encore plus de volatilité","Sell even more volatility"),run:s=>decide(s,p,"lean",{line:"deriv",sec:{rhoAdd:0.05},delayFr:"Choc de volatilité sur un book très court de vega.",delayEn:"Vol shock on a deeply short-vega book."})} ]}) ],
 };
 function decisionMods(){ return Object.keys(DECISIONS); }
 /* ---- tâches : construire un graphe / remplir un rapport ---- */
 function eid(){ return "x"+Date.now()+Math.floor(Math.random()*99999); }
+/* ---- generateur de taches-graphes : 11 familles, donnees realistes ---- */
+const GT_DAYS={fr:["J1","J2","J3","J4","J5","J6","J7"],en:["D1","D2","D3","D4","D5","D6","D7"]};
+const GT_MONTHS={fr:["Jan","Fév","Mar","Avr","Mai","Jun"],en:["Jan","Feb","Mar","Apr","May","Jun"]};
+function gtSeries(n,base,vol){ const o=[];let v=base; for(let i=0;i<n;i++){v=Math.max(5,v+noise(base*vol));o.push(Math.round(v));} return o; }
 function makeGraphTask(){
-  const which=ri(0,2);
-  if(which===0){ const vals=[]; for(let i=0;i<6;i++)vals.push(ri(60,170)); let mx=0; vals.forEach((v,i)=>{if(v>vals[mx])mx=i;});
-    return {kind:"graph",id:eid(),concept:"var_param",dataKind:"values",
-      boss:B("« Trace-moi l'évolution de la VaR de la semaine et dis-moi le jour de pointe. »","'Plot this week's VaR for me and tell me the peak day.'"),
-      objective:B("Montrer l'évolution d'une grandeur dans le temps","Show how a quantity evolves over time"),
-      labels:{fr:["J1","J2","J3","J4","J5","J6"],en:["D1","D2","D3","D4","D5","D6"]}, values:vals,
-      correctKind:"line", question:B("Quel jour la VaR est-elle la plus élevée ?","Which day is VaR highest?"),
-      options:["J1","J2","J3","J4","J5","J6"].map((d,i)=>B(d,"D"+(i+1))), correct:mx}; }
-  if(which===1){ const vals=[ri(20,60),ri(20,60),ri(20,60),ri(20,60)]; let mx=0; vals.forEach((v,i)=>{if(v>vals[mx])mx=i;});
-    return {kind:"graph",id:eid(),concept:"risk_taxonomy",dataKind:"values",
-      boss:B("« Compare le poids de chaque type de risque et dis-moi lequel domine. »","'Compare each risk type's weight and tell me which dominates.'"),
-      objective:B("Comparer des catégories distinctes","Compare distinct categories"),
-      labels:{fr:["Marché","Crédit","Op","Liquidité"],en:["Market","Credit","Op","Liquidity"]}, values:vals,
-      correctKind:"bar", question:B("Quelle catégorie de risque pèse le plus ?","Which risk category weighs most?"),
-      options:[B("Marché","Market"),B("Crédit","Credit"),B("Op","Op"),B("Liquidité","Liquidity")], correct:mx}; }
-  const pts=[]; for(let i=0;i<4;i++)pts.push({x:ri(2,9),y:ri(3,12)}); let mx=0; pts.forEach((p,i)=>{if(p.y/p.x>pts[mx].y/pts[mx].x)mx=i;});
-  return {kind:"graph",id:eid(),concept:"raroc",dataKind:"points",
-    boss:B("« Visualise rendement vs risque de nos 4 desks et dis-moi le meilleur ratio. »","'Plot return vs risk for our 4 desks and tell me the best ratio.'"),
-    objective:B("Visualiser la relation entre deux variables","Visualise the relationship between two variables"),
-    labels:{fr:["A","B","C","D"],en:["A","B","C","D"]}, points:pts,
-    correctKind:"scatter", question:B("Quel desk offre le meilleur rendement par unité de risque ?","Which desk has the best return per unit of risk?"),
-    options:["A","B","C","D"].map(d=>B("Desk "+d,"Desk "+d)), correct:mx};
+  const which=ri(0,10);
+  const mk=(o)=>Object.assign({kind:"graph",id:eid(),dataKind:"values"},o);
+  if(which===0){ const vals=gtSeries(7,ri(60,160),0.14); let mx=0;vals.forEach((v,i)=>{if(v>vals[mx])mx=i;});
+    return mk({concept:"var_param",boss:B("« Trace la VaR de la semaine et donne-moi le jour de pointe. »","'Plot this week's VaR and give me the peak day.'"),
+      objective:B("Évolution d'une grandeur dans le temps","A quantity's evolution over time"),labels:GT_DAYS,values:vals,correctKind:"line",
+      question:B("Quel jour la VaR est-elle la plus élevée ?","Which day is VaR highest?"),options:GT_DAYS.fr.map((d,i)=>B(d,GT_DAYS.en[i])),correct:mx}); }
+  if(which===1){ const vals=gtSeries(7,ri(60,160),0.14); let mn=0;vals.forEach((v,i)=>{if(v<vals[mn])mn=i;});
+    return mk({concept:"lcr",boss:B("« Montre-moi le coussin de liquidité de la semaine : où était le point bas ? »","'Show me this week's liquidity buffer: where was the low?'"),
+      objective:B("Évolution d'une grandeur dans le temps","A quantity's evolution over time"),labels:GT_DAYS,values:vals,correctKind:"line",
+      question:B("Quel jour le coussin était-il au plus bas ?","Which day was the buffer lowest?"),options:GT_DAYS.fr.map((d,i)=>B(d,GT_DAYS.en[i])),correct:mn}); }
+  if(which===2){ const vals=[ri(20,60),ri(20,60),ri(20,60),ri(20,60)]; let mx=0;vals.forEach((v,i)=>{if(v>vals[mx])mx=i;});
+    return mk({concept:"risk_taxonomy",boss:B("« Compare le poids de chaque risque : lequel domine ? »","'Compare each risk's weight: which dominates?'"),
+      objective:B("Comparer des catégories distinctes","Compare distinct categories"),labels:{fr:["Marché","Crédit","Op","Liquidité"],en:["Market","Credit","Op","Liquidity"]},values:vals,correctKind:"bar",
+      question:B("Quelle catégorie pèse le plus ?","Which category weighs most?"),options:[B("Marché","Market"),B("Crédit","Credit"),B("Op","Op"),B("Liquidité","Liquidity")],correct:mx}); }
+  if(which===3){ const pts=[];for(let i=0;i<4;i++)pts.push({x:ri(2,9),y:ri(3,12)}); let mx=0;pts.forEach((p,i)=>{if(p.y/p.x>pts[mx].y/pts[mx].x)mx=i;});
+    return mk({concept:"raroc",dataKind:"points",boss:B("« Rendement contre risque de nos 4 desks : lequel a le meilleur ratio ? »","'Return vs risk for our 4 desks: best ratio?'"),
+      objective:B("Relation entre deux variables","Relationship between two variables"),labels:{fr:["A","B","C","D"],en:["A","B","C","D"]},points:pts,correctKind:"scatter",
+      question:B("Quel desk a le meilleur rendement par unité de risque ?","Which desk has the best return per unit of risk?"),options:["A","B","C","D"].map(d=>B("Desk "+d,"Desk "+d)),correct:mx}); }
+  if(which===4){ const th=ri(90,130); const vals=gtSeries(7,th-ri(5,20),0.16); let n=0;vals.forEach(v=>{if(v>th)n++;}); if(n===0){vals[ri(1,5)]=th+ri(4,20); n=1;}
+    const cands=[...new Set([n,Math.max(0,n-1),n+1,n+2])].slice(0,4); while(cands.length<4)cands.push(cands[cands.length-1]+1);
+    const order=shuffle(cands.map((v,i)=>({v,i:v===n?0:i+1})));
+    return mk({concept:"risk_appetite",boss:B(`« Limite interne à ${th}. Combien de jours l'avons-nous dépassée ? »`,`'Internal limit at ${th}. How many days did we breach it?'`),
+      objective:B("Surveillance d'une limite","Limit monitoring"),labels:GT_DAYS,values:vals,correctKind:"line",vopts:{threshold:th,thLabel:B("limite","limit")},
+      question:B("Nombre de jours au-dessus de la limite ?","Number of days above the limit?"),
+      options:order.map(x=>B(String(x.v),String(x.v))),correct:order.findIndex(x=>x.v===n)}); }
+  if(which===5){ const dir=pick(["up","down","flat"]);
+    const base=ri(70,120); const vals=[]; for(let i=0;i<7;i++){ const drift=dir==="up"?i*base*0.05:dir==="down"?-i*base*0.05:0; vals.push(Math.max(8,Math.round(base+drift+noise(base*0.05)))); }
+    const opts=[B("Hausse tendancielle","Upward trend"),B("Baisse tendancielle","Downward trend"),B("Stable / sans tendance","Flat / no trend")];
+    const correct=dir==="up"?0:dir==="down"?1:2;
+    return mk({concept:"volatility",boss:B("« Caractérise-moi la dynamique du spread sur la semaine. »","'Characterise the spread's dynamic over the week.'"),
+      objective:B("Identifier une tendance","Identify a trend"),labels:GT_DAYS,values:vals,correctKind:"line",
+      question:B("Quelle dynamique décrit le mieux la série ?","Which dynamic best describes the series?"),options:opts,correct}); }
+  if(which===6){ const vals=gtSeries(6,ri(30,80),0.10); let mx=1,best=-1e9; for(let i=1;i<6;i++){const d=vals[i]-vals[i-1]; if(d>best){best=d;mx=i;}}
+    return mk({concept:"oprisk",boss:B("« Sur quel mois les incidents ont-ils le plus augmenté d'un coup ? »","'Which month saw the sharpest jump in incidents?'"),
+      objective:B("Comparer des périodes","Compare periods"),labels:GT_MONTHS,values:vals,correctKind:"bar",
+      question:B("Plus forte hausse d'un mois sur l'autre ?","Largest month-over-month increase?"),options:GT_MONTHS.fr.map((m,i)=>B(m,GT_MONTHS.en[i])),correct:mx}); }
+  if(which===7){ const sign=pick([1,-1,0]); const pts=[]; for(let i=0;i<6;i++){const x=ri(2,10); const y=sign===0?ri(3,11):Math.max(1,Math.round(6+sign*x*0.8+noise(1.4))); pts.push({x,y});}
+    const correct=sign===1?0:sign===-1?1:2;
+    return mk({concept:"correlation_stat",dataKind:"points",boss:B("« Ces deux facteurs sont-ils corrélés ? Regarde le nuage. »","'Are these two factors correlated? Look at the scatter.'"),
+      objective:B("Relation entre deux variables","Relationship between two variables"),labels:{fr:["a","b","c","d","e","f"],en:["a","b","c","d","e","f"]},points:pts,correctKind:"scatter",
+      question:B("Quel est le signe de la corrélation ?","What is the sign of the correlation?"),options:[B("Positive","Positive"),B("Négative","Negative"),B("Proche de zéro","Near zero")],correct}); }
+  if(which===8){ const k=ri(2,4); const base=ri(50,80), hi=base+ri(25,45); const vals=[]; for(let i=0;i<7;i++)vals.push(Math.round((i<k?base:hi)+noise(4)));
+    return mk({concept:"volatility",boss:B("« Le régime a changé en cours de semaine : quel jour ? »","'The regime shifted mid-week: which day?'"),
+      objective:B("Détecter une rupture","Detect a break"),labels:GT_DAYS,values:vals,correctKind:"line",
+      question:B("À partir de quel jour le niveau a-t-il durablement changé ?","From which day did the level durably shift?"),options:GT_DAYS.fr.map((d,i)=>B(d,GT_DAYS.en[i])),correct:k}); }
+  if(which===9){ const buckets=["0-5","5-10","10-20","20-40","40+"]; const vals=[ri(40,60),ri(20,35),ri(8,16),ri(2,6),ri(1,3)];
+    return mk({concept:"es",boss:B("« Voici la distribution des pertes (M€). Quelle tranche représente la queue extrême ? »","'Here is the loss distribution (€M). Which bucket is the extreme tail?'"),
+      objective:B("Lire une distribution","Read a distribution"),labels:{fr:buckets,en:buckets},values:vals,correctKind:"bar",
+      question:B("Quelle tranche correspond aux pertes extrêmes (queue) ?","Which bucket is the extreme-loss tail?"),options:buckets.map(b=>B(b+" M€",b+" €M")),correct:4}); }
+  { const sc=pick([[B("« Je veux suivre l'évolution du ratio dans le temps. »","'I want to track the ratio over time.'"),"line"],
+                   [B("« Je veux comparer les pertes par division. »","'I want to compare losses by division.'"),"bar"],
+                   [B("« Je veux voir si le risque explique le rendement. »","'I want to see whether risk explains return.'"),"scatter"]]);
+    const vals=gtSeries(6,ri(40,90),0.12);
+    return mk({concept:"risk_taxonomy",boss:sc[0],objective:B("Choisir la bonne représentation","Choose the right representation"),
+      labels:GT_MONTHS,values:vals,correctKind:sc[1],
+      question:B("Quel type de graphe est le plus adapté à la demande ?","Which chart type best fits the request?"),
+      options:[B("Ligne","Line"),B("Barres","Bars"),B("Nuage de points","Scatter")],correct:sc[1]==="line"?0:sc[1]==="bar"?1:2}); }
 }
+/* ---- rapports compositionnels : themes x banque de paragraphes parametres ---- */
+const RPT_TITLES=[B("Note au comité des risques","Note to the risk committee"),B("Mémo de crédit","Credit memo"),B("Point liquidité hebdomadaire","Weekly liquidity update"),B("Synthèse risque de marché","Market risk summary"),B("Revue du dispositif opérationnel","Operational framework review"),B("Brief réglementaire Bâle III","Basel III regulatory brief"),B("Analyse de contrepartie","Counterparty analysis"),B("Note de stress test","Stress-testing note"),B("Rapport au CRO","Report to the CRO"),B("Dossier pour l'audit interne","File for internal audit"),B("Note sur le book de dérivés","Derivatives book note"),B("Mémo ALM taux","Rates ALM memo")];
+const RPT_PARAS=[
+ {c:"var_param",g:()=>{const cf=pick(["95 %","99 %"]);return [
+   {t:B("La VaR "+cf+" à 1 jour s'interprète comme la perte qui ne devrait être dépassée que dans ","The 1-day "+cf+" VaR is the loss that should only be exceeded in ")},
+   {blank:[B(cf==="99 %"?"1 % des cas":"5 % des cas",cf==="99 %"?"1% of cases":"5% of cases"),B(cf==="99 %"?"99 % des cas":"95 % des cas",cf==="99 %"?"99% of cases":"95% of cases"),B("la moitié des cas","half of cases")],correct:0},
+   {t:B(". Élever le niveau de confiance fait ",". Raising the confidence level makes the VaR ")},
+   {blank:[B("monter la VaR","go up"),B("baisser la VaR","go down"),B("rester la VaR inchangée","stay unchanged")],correct:0},{t:B(".",".")}];}},
+ {c:"es",g:()=>[
+   {t:B("La VaR ignore l'ampleur des pertes au-delà du seuil ; on la complète donc par l'","VaR ignores the size of losses beyond the threshold; we therefore complement it with ")},
+   {blank:[B("Expected Shortfall","Expected Shortfall"),B("le ratio de Sharpe","the Sharpe ratio"),B("la duration","duration")],correct:0},
+   {t:B(", qui calcule la perte moyenne dans la queue. Sous FRTB, le capital de marché repose sur l'",", which averages tail losses. Under FRTB, market capital rests on the ")},
+   {blank:[B("ES 97,5 %","97.5% ES"),B("VaR 95 %","95% VaR"),B("EL 99 %","99% EL")],correct:0},{t:B(".",".")}]},
+ {c:"el",g:()=>{const pd=rnd(1,5).toFixed(1);return [
+   {t:B("Avec une PD de "+pd+" %, la perte attendue du portefeuille vaut PD × LGD × ","With a "+pd+"% PD, the portfolio's expected loss equals PD × LGD × ")},
+   {blank:[B("EAD","EAD"),B("VaR","VaR"),B("RWA","RWA")],correct:0},
+   {t:B(". Cette perte attendue doit être couverte par ",". This expected loss must be covered by ")},
+   {blank:[B("les provisions / le pricing","provisions / pricing"),B("le capital uniquement","capital only"),B("les HQLA","HQLA")],correct:0},{t:B(", le capital couvrant la perte inattendue.",", with capital covering unexpected loss.")}];}},
+ {c:"lgd",g:()=>[
+   {t:B("Le renforcement du collatéral obtenu sur ce dossier fait principalement ","The stronger collateral obtained on this file mainly ")},
+   {blank:[B("baisser la LGD","lowers the LGD"),B("baisser la PD","lowers the PD"),B("monter l'EAD","raises the EAD")],correct:0},
+   {t:B(" : en cas de défaut, le recouvrement augmente. La PD, elle, dépend de ",": on default, recovery improves. PD itself depends on ")},
+   {blank:[B("la qualité de l'emprunteur","borrower quality"),B("la garantie","the collateral"),B("notre financement","our funding")],correct:0},{t:B(".",".")}]},
+ {c:"lcr",g:()=>{const v=ri(70,98);return [
+   {t:B("Le LCR ressort à "+v+" %, sous le minimum réglementaire de ","The LCR prints at "+v+"%, below the regulatory minimum of ")},
+   {blank:[B("100 %","100%"),B("50 %","50%"),B("8 %","8%")],correct:0},
+   {t:B(". Pour le restaurer, l'action la plus directe consiste à ",". The most direct fix is to ")},
+   {blank:[B("accroître les HQLA","increase HQLA"),B("accroître les prêts long terme","increase long-term loans"),B("réduire le capital","reduce capital")],correct:0},{t:B(" ou à réduire les sorties nettes à 30 jours."," or to cut 30-day net outflows.")}];}},
+ {c:"nsfr",g:()=>[
+   {t:B("Contrairement au LCR (30 jours), le NSFR mesure la stabilité du financement à horizon ","Unlike the 30-day LCR, the NSFR measures funding stability over ")},
+   {blank:[B("1 an","1 year"),B("1 mois","1 month"),B("10 ans","10 years")],correct:0},
+   {t:B(". Allonger la maturité du financement de gros fait ",". Terming out wholesale funding makes the NSFR ")},
+   {blank:[B("monter le ratio","rise"),B("baisser le ratio","fall"),B("varier la VaR","change VaR")],correct:0},{t:B(".",".")}]},
+ {c:"basel3",g:()=>[
+   {t:B("Le pilier 1 de Bâle fixe les exigences minimales de ","Basel's Pillar 1 sets minimum requirements for ")},
+   {blank:[B("capital (crédit, marché, op)","capital (credit, market, op)"),B("gouvernance","governance"),B("communication financière","disclosure")],correct:0},
+   {t:B(" ; la discipline de marché par la transparence relève du ","; market discipline via transparency belongs to ")},
+   {blank:[B("pilier 3","Pillar 3"),B("pilier 2","Pillar 2"),B("pilier 1","Pillar 1")],correct:0},{t:B(".",".")}]},
+ {c:"leverage",g:()=>[
+   {t:B("Le ratio de levier rapporte le Tier 1 à l'exposition ","The leverage ratio divides Tier 1 by ")},
+   {blank:[B("totale non pondérée","total unweighted exposure"),B("pondérée du risque","risk-weighted exposure"),B("aux seuls dérivés","derivatives only")],correct:0},
+   {t:B(" : il sert de garde-fou contre la sous-estimation des ",": it backstops the underestimation of ")},
+   {blank:[B("pondérations de risque","risk weights"),B("dépôts","deposits"),B("commissions","fees")],correct:0},{t:B(".",".")}]},
+ {c:"duration",g:()=>{const bp=pick([100,150,200]);return [
+   {t:B("Un choc de +"+bp+" bp ferait, en première approximation (duration), ","A +"+bp+" bp shock would, to first order (duration), make bond prices ")},
+   {blank:[B("baisser le prix des obligations","fall"),B("monter le prix des obligations","rise"),B("laisser les prix inchangés","stay flat")],correct:0},
+   {t:B(". L'effet est d'autant plus fort que la duration est ",". The effect grows with ")},
+   {blank:[B("longue","longer duration"),B("courte","shorter duration"),B("négative","negative duration")],correct:0},{t:B(".",".")}];}},
+ {c:"convexity",g:()=>[
+   {t:B("Pour de grands chocs de taux, l'approximation par la duration seule ","For large rate shocks, the duration-only approximation ")},
+   {blank:[B("surestime la baisse de prix","overstates the price fall"),B("sous-estime la baisse de prix","understates the price fall"),B("est exacte","is exact")],correct:0},
+   {t:B(" : la convexité positive joue en faveur du détenteur, dans ",": positive convexity favours the holder in ")},
+   {blank:[B("les deux sens","both directions"),B("la hausse seulement","rises only"),B("la baisse seulement","falls only")],correct:0},{t:B(".",".")}]},
+ {c:"delta",g:()=>[
+   {t:B("Le delta-hedge neutralise le risque ","Delta-hedging neutralises ")},
+   {blank:[B("directionnel de premier ordre","first-order directional risk"),B("de volatilité","volatility risk"),B("de crédit","credit risk")],correct:0},
+   {t:B(" mais laisse le book exposé au ",", but leaves the book exposed to ")},
+   {blank:[B("gamma (grands mouvements)","gamma (large moves)"),B("notionnel","notional"),B("change uniquement","FX only")],correct:0},{t:B(", d'où des rebalancements répétés.",", hence repeated rebalancing.")}]},
+ {c:"vega",g:()=>[
+   {t:B("Le book est long options, donc ","The book is long options, hence ")},
+   {blank:[B("long vega","long vega"),B("short vega","short vega"),B("sans vega","vega-flat")],correct:0},
+   {t:B(" : une hausse de la volatilité implicite ",": a rise in implied volatility ")},
+   {blank:[B("augmente sa valeur","increases its value"),B("réduit sa valeur","reduces its value"),B("n'a aucun effet","has no effect")],correct:0},{t:B(".",".")}]},
+ {c:"cva",g:()=>[
+   {t:B("Le CVA ajuste la valeur des dérivés pour le risque de ","CVA adjusts derivative values for ")},
+   {blank:[B("défaut de la contrepartie","counterparty default risk"),B("taux","rate risk"),B("liquidité de marché","market liquidity")],correct:0},
+   {t:B(". L'élargissement des spreads CDS de la contrepartie fait ",". Wider counterparty CDS spreads make the CVA ")},
+   {blank:[B("monter le CVA","rise"),B("baisser le CVA","fall"),B("disparaître le CVA","vanish")],correct:0},{t:B(".",".")}]},
+ {c:"netting",g:()=>[
+   {t:B("L'accord de netting réduit l'exposition en compensant ","The netting agreement cuts exposure by offsetting ")},
+   {blank:[B("les positions de sens opposés","opposite-sign positions"),B("les commissions","fees"),B("les dépôts","deposits")],correct:0},
+   {t:B(" ; combiné à des appels de marge, il limite la ","; combined with margin calls, it limits ")},
+   {blank:[B("PFE (exposition future)","PFE (future exposure)"),B("duration","duration"),B("VaR de taux","rate VaR")],correct:0},{t:B(".",".")}]},
+ {c:"oprisk",g:()=>[
+   {t:B("Les pertes opérationnelles se modélisent par ","Operational losses are modelled via ")},
+   {blank:[B("fréquence × sévérité","frequency × severity"),B("PD × LGD","PD × LGD"),B("delta × gamma","delta × gamma")],correct:0},
+   {t:B(". Les contrôles clés réduisent surtout ",". Key controls mainly reduce ")},
+   {blank:[B("la fréquence des incidents","incident frequency"),B("la volatilité de marché","market volatility"),B("le coût du capital","the cost of capital")],correct:0},{t:B(", l'assurance transférant une partie de la sévérité.",", with insurance transferring part of the severity.")}]},
+ {c:"kri",g:()=>[
+   {t:B("Les KRI sont des indicateurs ","KRIs are ")},
+   {blank:[B("avancés, qui alertent avant la perte","leading indicators that warn before the loss"),B("comptables de fin d'année","year-end accounting items"),B("de performance commerciale","sales performance metrics")],correct:0},
+   {t:B(" ; leur dépassement déclenche ","; breaching them triggers ")},
+   {blank:[B("une escalade et un plan d'action","escalation and an action plan"),B("un dividende","a dividend"),B("une baisse de VaR automatique","an automatic VaR cut")],correct:0},{t:B(".",".")}]},
+ {c:"three_lines",g:()=>[
+   {t:B("Dans le modèle des trois lignes de défense, la gestion quotidienne du risque appartient ","In the three-lines model, day-to-day risk ownership sits with ")},
+   {blank:[B("aux métiers (1re ligne)","the business (1st line)"),B("à l'audit interne","internal audit"),B("au régulateur","the regulator")],correct:0},
+   {t:B(", la fonction risque indépendante formant la ",", the independent risk function forming the ")},
+   {blank:[B("2e ligne","2nd line"),B("3e ligne","3rd line"),B("4e ligne","4th line")],correct:0},{t:B(", et l'audit la 3e.",", and audit the 3rd.")}]},
+ {c:"backtest",g:()=>[
+   {t:B("Le backtesting compare les pertes réalisées à ","Backtesting compares realised losses to ")},
+   {blank:[B("la VaR prévue","the predicted VaR"),B("au budget","the budget"),B("aux fonds propres","own funds")],correct:0},
+   {t:B(" ; trop d'exceptions place le modèle en zone ","; too many exceptions puts the model in the ")},
+   {blank:[B("rouge (rejet)","red zone (rejected)"),B("verte","green zone"),B("neutre","neutral zone")],correct:0},{t:B(" au sens de Bâle."," in the Basel sense.")}]},
+ {c:"risk_appetite",g:()=>[
+   {t:B("Contrairement à la VaR, le stress test évalue des scénarios ","Unlike VaR, stress testing evaluates scenarios that are ")},
+   {blank:[B("sévères mais plausibles","severe but plausible"),B("moyens et fréquents","average and frequent"),B("purement historiques","purely historical")],correct:0},
+   {t:B(", sans probabilité associée. Il sert notamment à dimensionner ",", with no attached probability. It notably sizes ")},
+   {blank:[B("les coussins de capital et de liquidité","capital and liquidity buffers"),B("les bonus","bonuses"),B("le theta du book","the book's theta")],correct:0},{t:B(".",".")}]},
+ {c:"pd",g:()=>[
+   {t:B("La dégradation de la notation interne de l'emprunteur traduit une hausse de ","The borrower's internal downgrade reflects a higher ")},
+   {blank:[B("sa PD","PD"),B("sa LGD","LGD"),B("notre EAD","EAD")],correct:0},
+   {t:B(" ; à pricing inchangé, la marge ne couvre plus ","; at unchanged pricing, the margin no longer covers ")},
+   {blank:[B("la perte attendue","expected loss"),B("le notionnel","the notional"),B("les frais généraux","overheads")],correct:0},{t:B(".",".")}]},
+ {c:"concentration",g:()=>[
+   {t:B("La concentration sectorielle du book accroît le risque de ","The book's sector concentration raises the risk of ")},
+   {blank:[B("défauts corrélés","correlated defaults"),B("theta","theta"),B("base","basis")],correct:0},
+   {t:B(" : en cas de choc sectoriel, les pertes arrivent ",": under a sector shock, losses arrive ")},
+   {blank:[B("ensemble","together"),B("une par une","one by one"),B("jamais","never")],correct:0},{t:B(", ce que la diversification aurait limité.",", which diversification would have limited.")}]},
+ {c:"funding_liq",g:()=>[
+   {t:B("Le risque de liquidité de financement se matérialise quand la banque ","Funding liquidity risk materialises when the bank ")},
+   {blank:[B("ne peut plus se refinancer à coût raisonnable","can no longer refinance at reasonable cost"),B("gagne trop d'argent","earns too much"),B("réduit sa VaR","cuts its VaR")],correct:0},
+   {t:B(" ; le financement de gros court terme est ","; short-term wholesale funding is ")},
+   {blank:[B("le plus fragile en stress","the most fragile under stress"),B("le plus stable","the most stable"),B("sans importance","irrelevant")],correct:0},{t:B(".",".")}]},
+ {c:"systemic",g:()=>[
+   {t:B("En crise systémique, les corrélations entre actifs ont tendance à ","In a systemic crisis, asset correlations tend to ")},
+   {blank:[B("monter vers 1","rise towards 1"),B("tomber vers 0","fall to 0"),B("devenir négatives","turn negative")],correct:0},
+   {t:B(", ce qui ",", which ")},
+   {blank:[B("réduit l'effet de la diversification","erodes diversification"),B("supprime la VaR","removes VaR"),B("améliore le LCR","improves the LCR")],correct:0},{t:B(" précisément quand on en a besoin."," precisely when it is needed.")}]},
+ {c:"raroc",g:()=>[
+   {t:B("Le RAROC rapporte le revenu net des pertes attendues ","RAROC divides revenue net of expected losses by ")},
+   {blank:[B("au capital économique","economic capital"),B("au chiffre d'affaires","turnover"),B("aux dépôts","deposits")],correct:0},
+   {t:B(" : une affaire rentable en apparence peut détruire de la valeur si ",": a seemingly profitable deal can destroy value if ")},
+   {blank:[B("elle consomme trop de capital","it consumes too much capital"),B("elle est trop courte","it is too short"),B("le client est fidèle","the client is loyal")],correct:0},{t:B(".",".")}]},
+ {c:"frtb",g:()=>[
+   {t:B("FRTB redéfinit la frontière entre trading book et banking book et remplace la VaR par ","FRTB redraws the trading/banking-book boundary and replaces VaR with ")},
+   {blank:[B("l'ES 97,5 %","97.5% ES"),B("le LCR","the LCR"),B("la duration","duration")],correct:0},
+   {t:B(", avec des horizons de liquidité ",", with liquidity horizons ")},
+   {blank:[B("différenciés par facteur de risque","differentiated by risk factor"),B("identiques pour tous","identical for all"),B("supprimés","removed")],correct:0},{t:B(".",".")}]},
+ {c:"merton",g:()=>[
+   {t:B("Dans l'approche structurelle (Merton), le défaut survient quand ","In the structural (Merton) approach, default occurs when ")},
+   {blank:[B("la valeur des actifs passe sous la dette","asset value falls below debt"),B("le cours de bourse double","the share price doubles"),B("les taux baissent","rates fall")],correct:0},
+   {t:B(" ; les capitaux propres s'analysent comme ","; equity behaves like ")},
+   {blank:[B("un call sur les actifs","a call on the assets"),B("un put sur la dette","a put on the debt"),B("une obligation d'État","a government bond")],correct:0},{t:B(".",".")}]},
+];
 function makeReportTask(){
-  const tpl=ri(0,1);
-  if(tpl===0) return {kind:"report",id:eid(),concept:"es",title:B("Note de risque de marché","Market risk note"),
-    boss:B("« Complète cette note pour le comité des risques — chaque terme doit être juste. »","'Fill in this note for the risk committee — every term must be correct.'"),
-    segments:[ {t:B("La VaR à 99 % estime la perte maximale attendue dans ","The 99% VaR estimates the maximum expected loss in ")},
-      {blank:[B("99 %","99%"),B("1 %","1%"),B("50 %","50%")],correct:0},
-      {t:B(" des cas. Comme elle ignore l'ampleur de la queue, on la complète par l'","of cases. As it ignores the size of the tail, we complement it with ")},
-      {blank:[B("Expected Shortfall","Expected Shortfall"),B("la duration","duration"),B("le beta","beta")],correct:0},
-      {t:B(", qui en calcule la moyenne. Sous la FRTB, le capital de marché repose sur l'","which averages it. Under FRTB, market capital relies on ")},
-      {blank:[B("ES 97,5 %","97.5% ES"),B("VaR 95 %","95% VaR"),B("CAPM","CAPM")],correct:0},
-      {t:B(".",".")} ]};
-  return {kind:"report",id:eid(),concept:"el",title:B("Mémo de crédit","Credit memo"),
-    boss:B("« Complète ce mémo crédit — une erreur et le comité refuse le dossier. »","'Fill in this credit memo — one error and the committee rejects the file.'"),
-    segments:[ {t:B("La perte attendue d'un prêt vaut PD × LGD × ","A loan's expected loss equals PD × LGD × ")},
-      {blank:[B("EAD","EAD"),B("VaR","VaR"),B("duration","duration")],correct:0},
-      {t:B(". Ajouter un collatéral solide fait surtout ","Adding strong collateral mainly ")},
-      {blank:[B("baisser la LGD","lowers the LGD"),B("monter la PD","raises the PD"),B("monter l'EAD","raises the EAD")],correct:0},
-      {t:B(", ce qui réduit la perte. Le capital, lui, couvre surtout la perte ","which cuts the loss. Capital itself mainly covers the ")},
-      {blank:[B("inattendue","unexpected"),B("attendue","expected"),B("moyenne","average")],correct:0},
-      {t:B(".",".")} ]};
+  const paras=shuffle(RPT_PARAS.slice()).slice(0,3);
+  let segments=[]; paras.forEach((p,i)=>{ const seg=p.g(); if(i>0)segments.push({t:B("  ","  ")}); segments=segments.concat(seg); });
+  const c0=paras[0].c;
+  return {kind:"report",id:eid(),concept:conceptById(c0)?c0:"es",
+    title:pick(RPT_TITLES),
+    boss:pick([B("« Complète cette note pour le comité — chaque terme doit être juste. »","'Fill in this note for the committee — every term must be right.'"),
+               B("« Je signe ce document dans une heure. Pas une approximation. »","'I sign this in an hour. No approximations.'"),
+               B("« L'audit lira chaque ligne. Choisis tes termes avec rigueur. »","'Audit will read every line. Choose your terms rigorously.'")]),
+    segments};
 }
 let taskState=null;
 function showHeld(h,holder){ if(holder._open)closeSheet(); openSheet(h); holder._open=true; }
@@ -2110,7 +2629,7 @@ function drawGraphTask(){ const ts=taskState,task=ts.task;
     const vals = task.values || (task.points||[]).map(p=>p.y);
     const pts = task.points || (task.values||[]).map((v,i)=>({x:i+1,y:v}));
     const series= ts.pickKind==="scatter"?[{color:"var(--brand)",points:pts}]:[{color:"var(--brand)",values:vals}];
-    h+=miniChartSVG(ts.pickKind,labels,series,null);
+    h+=miniChartSVG(ts.pickKind,labels,series,null,task.vopts||null);
     h+=`<div style="font-size:13px;color:var(--muted);margin-top:4px">${t("2) Lis ton graphe :","2) Read your chart:")} <b>${esc(L(task.question))}</b></div>`;
     task.options.forEach((o,i)=>{ const cls=ts.ans==null?'':(i===task.correct?'right':(i===ts.ans?'wrong':'')); h+=`<button class="qopt ${cls}" onclick="graphAnswer(${i})"><span class="qk">${String.fromCharCode(65+i)}</span><span>${esc(L(o))}</span></button>`; }); }
   if(ts.ans!=null){ const grade=(ts.pickKind===task.correctKind?0.5:0)+(ts.ans===task.correct?0.5:0); ts.grade=grade;
